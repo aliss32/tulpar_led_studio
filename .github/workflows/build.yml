@@ -1,0 +1,47 @@
+name: Build Tulpar LED Studio
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust kur
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Derle
+        run: cargo build --release
+
+      - name: Dosyalari hazirla
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\tulpar_led_studio.exe dist\TulparLedStudio.exe
+          Copy-Item OKU_BENI.txt dist\ -ErrorAction SilentlyContinue
+          Copy-Item InsydeDCHU.dll dist\ -ErrorAction SilentlyContinue
+
+      - name: Artifact yukle
+        uses: actions/upload-artifact@v4
+        with:
+          name: TulparLedStudio
+          path: dist/
+
+      - name: Release olustur (v* tag'inde)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
