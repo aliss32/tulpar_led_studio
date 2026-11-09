@@ -32,9 +32,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target\release\tulpar_led_studio.exe dist\TulparLedStudio.exe
           Copy-Item OKU_BENI.txt dist\ -ErrorAction SilentlyContinue
-          Copy-Item InsydeDCHU.dll dist\ -ErrorAction SilentlyContinue
-          Copy-Item ControlGPU.exe dist\ -ErrorAction SilentlyContinue
-          Copy-Item NVGPU_DLL.dll dist\ -ErrorAction SilentlyContinue
 
       - name: Artifact yukle
         uses: actions/upload-artifact@v4
