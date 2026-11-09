@@ -452,6 +452,17 @@ struct Settings {
 }
 
 fn default_dll() -> String {
+    let up = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\aliha".to_string());
+    let cands = [
+        format!("{}\\Desktop\\tstudio\\InsydeDCHU.dll", up),
+        format!("{}\\Desktop\\tstudio\\FnKey\\CC40\\InsydeDCHU.dll", up),
+        format!("{}\\Desktop\\InsydeDCHU.dll", up),
+    ];
+    for c in &cands {
+        if std::path::Path::new(c).exists() {
+            return c.clone();
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("InsydeDCHU.dll");
@@ -460,7 +471,6 @@ fn default_dll() -> String {
             }
         }
     }
-    let up = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\aliha".to_string());
     format!("{}\\Desktop\\InsydeDCHU.dll", up)
 }
 
@@ -1289,15 +1299,6 @@ fn start_audio(sens: Arc<Sensors>) {
 //  Performans altyapisi & ThrottleStop Tarzi Kontrol
 // ============================================================================
 
-/// 4 Hazir Guc Modu
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PowerPreset {
-    Performance = 0,   // Turbo acik, %100 CPU, Fan Auto/Performance
-    Entertainment = 1, // Standart dengeli mod
-    Quiet = 2,         // Fan ve isinma kisitli
-    PowerSaving = 3,   // Turbo kapali (%99 CPU), max tasarruf
-}
-
 /// DCHU salt-okuma: GetDCHU_Data_Integer
 type GetDataIntFn = unsafe extern "C" fn(i32, *mut i32) -> i32;
 /// DCHU yazma: SetDCHU_Data
@@ -1325,10 +1326,17 @@ fn load_dchu_set(dll_path: &str) -> Option<SetDataIntFn> {
     }
 }
 
+/// DCHU oku: InsydeDCHU.dll başarıda r'ye doğrudan okunan değeri döner (0 değil).
+/// Hata kodu: -2147483646 (0x80000002).
 fn dchu_read(f: GetDataIntFn, cmd: i32) -> Option<i32> {
     let mut v: i32 = 0;
     let r = unsafe { f(cmd, &mut v) };
-    if r == 0 && v != -2147483646i32 { Some(v) } else { None }
+    let val = if v != 0 { v } else { r };
+    if val != -2147483646i32 && val != 0 {
+        Some(val)
+    } else {
+        None
+    }
 }
 
 fn dchu_send_u32(f: SetDataIntFn, cmd: i32, val: u32) -> bool {
@@ -1337,7 +1345,40 @@ fn dchu_send_u32(f: SetDataIntFn, cmd: i32, val: u32) -> bool {
     r >= 0
 }
 
-/// Windows Guc Yonetimi uzerinden CPU Throttle & Turbo Boost kontrolu (ThrottleStop mantigi)
+/// Kullanıcının masaüstündeki tstudio klasörünü bul
+fn find_tstudio_dir() -> Option<std::path::PathBuf> {
+    let up = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\aliha".to_string());
+    let p = std::path::PathBuf::from(up).join("Desktop").join("tstudio");
+    if p.exists() { Some(p) } else { None }
+}
+
+/// ControlGPU.exe'nin yolunu bul (öncelik Masaüstü tstudio klasöründe)
+fn find_control_gpu_exe() -> Option<String> {
+    if let Some(dir) = find_tstudio_dir() {
+        let p1 = dir.join("ControlGPU.exe");
+        if p1.exists() { return Some(p1.to_string_lossy().to_string()); }
+        let p2 = dir.join("FnKey").join("CC40").join("ControlGPU.exe");
+        if p2.exists() { return Some(p2.to_string_lossy().to_string()); }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("ControlGPU.exe");
+            if p.exists() { return Some(p.to_string_lossy().to_string()); }
+        }
+    }
+    find_cc40_fnkey_path().map(|p| format!("{}\\ControlGPU.exe", p))
+}
+
+/// cc30wk.exe'nin yolunu bul
+fn find_cc30wk_exe() -> Option<String> {
+    if let Some(dir) = find_tstudio_dir() {
+        let p = dir.join("FnKey").join("cc30wk.exe");
+        if p.exists() { return Some(p.to_string_lossy().to_string()); }
+    }
+    find_cc40_fnkey_path().map(|p| format!("{}\\cc30wk.exe", p))
+}
+
+/// Windows Güç Yönetimi üzerinden CPU Throttle & Turbo Boost kontrolü
 fn apply_cpu_throttle(max_percent: u32) {
     let val_str = format!("{}", max_percent.min(100).max(50));
     let _ = std::process::Command::new("powercfg")
@@ -1354,35 +1395,47 @@ fn apply_cpu_throttle(max_percent: u32) {
         .status();
 }
 
+/// cc30wk.exe ile CC40 güç modunu çağır
+fn trigger_cc30wk_mode(mode_val: u32) {
+    if let Some(exe) = find_cc30wk_exe() {
+        let _ = std::process::Command::new(&exe)
+            .args(["0x0013", &format!("{}", mode_val)])
+            .creation_flags(0x0800_0000)
+            .status();
+    }
+}
+
 /// GPU frekans offseti (Core & Memory OC/UV) uygula (ControlGPU.exe)
 fn apply_gpu_offset(core_mhz: i16, mem_mhz: i16) {
-    let exe = if std::path::Path::new("ControlGPU.exe").exists() {
-        "ControlGPU.exe".to_string()
-    } else {
-        find_cc40_fnkey_path().map(|p| format!("{}\\ControlGPU.exe", p)).unwrap_or_else(|| "ControlGPU.exe".to_string())
-    };
-    let _ = std::process::Command::new(&exe)
-        .args(["set_increment", "0", &format!("{}", core_mhz), &format!("{}", mem_mhz)])
-        .creation_flags(0x0800_0000)
-        .status();
+    if let Some(exe) = find_control_gpu_exe() {
+        let work_dir = std::path::Path::new(&exe).parent().map(|p| p.to_path_buf());
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["set_increment", "0", &format!("{}", core_mhz), &format!("{}", mem_mhz)])
+           .creation_flags(0x0800_0000);
+        if let Some(w) = work_dir {
+            cmd.current_dir(w);
+        }
+        let _ = cmd.status();
+    }
 }
 
 /// GPU Thermal Limit ayarla (65C - 87C)
 fn apply_gpu_thermal_limit(limit_c: i16) {
-    let exe = if std::path::Path::new("ControlGPU.exe").exists() {
-        "ControlGPU.exe".to_string()
-    } else {
-        find_cc40_fnkey_path().map(|p| format!("{}\\ControlGPU.exe", p)).unwrap_or_else(|| "ControlGPU.exe".to_string())
-    };
-    let _ = std::process::Command::new(&exe)
-        .args(["STL", &format!("{}", limit_c)])
-        .creation_flags(0x0800_0000)
-        .status();
+    if let Some(exe) = find_control_gpu_exe() {
+        let work_dir = std::path::Path::new(&exe).parent().map(|p| p.to_path_buf());
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["STL", &format!("{}", limit_c)])
+           .creation_flags(0x0800_0000);
+        if let Some(w) = work_dir {
+            cmd.current_dir(w);
+        }
+        let _ = cmd.status();
+    }
 }
 
-/// Performans sekmesi icin paylasilan durum
+/// Performans sekmesi için paylaşılan durum
 struct PerfState {
-    // Sensorler
+    // Sensörler (DCHU EC)
     cpu_temp:     AtomicI32,
     gpu_temp_hw:  AtomicI32,
     cpu_fan_duty: AtomicI32,
@@ -1393,16 +1446,19 @@ struct PerfState {
     sensor_ok:    AtomicBool,
     last_read_ms: AtomicU64,
 
-    // Guncel Aktif Ayarlar
+    // Güncel Aktif Ayarlar
     active_preset:  AtomicU8, // 0=Perf, 1=Ent, 2=Quiet, 3=Save, 255=Custom
-    cpu_max_pct:    AtomicU32, // 100 veya 99 (turbo off)
+    cpu_max_pct:    AtomicU32, // 50 .. 100
     turbo_enabled:  AtomicBool,
     gpu_core_oc:    AtomicI32, // MHz (-200 .. +200)
     gpu_mem_oc:     AtomicI32, // MHz (-500 .. +500)
     gpu_temp_limit: AtomicI32, // 65 .. 87 C
-    fan_max_mode:   AtomicBool,
 
-    // Emir kuyrugu
+    // Fan Ayarları
+    fan_mode:       AtomicU8,  // 0 = Otomatik, 1 = Turbo %100, 2 = Manuel %
+    fan_manual_pct: AtomicU32, // %30 .. %100
+
+    // Emir kuyruğu
     apply_req: AtomicBool,
 }
 
@@ -1425,7 +1481,9 @@ impl PerfState {
             gpu_core_oc:    AtomicI32::new(0),
             gpu_mem_oc:     AtomicI32::new(0),
             gpu_temp_limit: AtomicI32::new(86),
-            fan_max_mode:   AtomicBool::new(false),
+
+            fan_mode:       AtomicU8::new(0),
+            fan_manual_pct: AtomicU32::new(70),
 
             apply_req: AtomicBool::new(false),
         }
@@ -1453,7 +1511,7 @@ fn find_cc40_fnkey_path() -> Option<String> {
     None
 }
 
-/// Arkaplan thread'i: Gercek EC sicaklik/fan sensorlerini okur & ayarlari uygular
+/// Arkaplan thread'i: Gerçek EC sensörlerini okur & ayarları uygular
 fn spawn_perf_thread(perf: Arc<PerfState>, dll_path: Arc<Mutex<String>>, epoch: Instant) {
     std::thread::spawn(move || {
         let mut last_dll = String::new();
@@ -1461,13 +1519,20 @@ fn spawn_perf_thread(perf: Arc<PerfState>, dll_path: Arc<Mutex<String>>, epoch: 
         let mut set_fn: Option<SetDataIntFn> = None;
 
         loop {
-            // Degisiklik istegi geldiyse uygula
+            // Değişiklik isteği geldiyse uygula
             if perf.apply_req.swap(false, Ordering::Relaxed) {
+                let preset = perf.active_preset.load(Ordering::Relaxed);
+                if preset == 0 {
+                    trigger_cc30wk_mode(0); // Performans
+                } else if preset == 2 || preset == 3 {
+                    trigger_cc30wk_mode(1); // Sessiz / Güç Tasarrufu
+                }
+
                 let turbo = perf.turbo_enabled.load(Ordering::Relaxed);
                 let pct = if turbo {
                     perf.cpu_max_pct.load(Ordering::Relaxed)
                 } else {
-                    99 // 99% = Intel Turbo Boost donanimsal olarak kapali (Base clock sınırı)
+                    99 // 99% = Intel Turbo Boost donanımsal olarak kapalı (Base clock sınırı)
                 };
                 apply_cpu_throttle(pct);
 
@@ -1479,15 +1544,23 @@ fn spawn_perf_thread(perf: Arc<PerfState>, dll_path: Arc<Mutex<String>>, epoch: 
                 apply_gpu_thermal_limit(t_lim);
 
                 if let Some(sf) = set_fn {
-                    if perf.fan_max_mode.load(Ordering::Relaxed) {
-                        dchu_send_u32(sf, 104, 100); // SetFanDuty %100
-                    } else {
-                        dchu_send_u32(sf, 105, 1);   // SetFanAutoDuty
+                    let fmode = perf.fan_mode.load(Ordering::Relaxed);
+                    if fmode == 0 {
+                        // Otomatik mod
+                        dchu_send_u32(sf, 105, 1);
+                    } else if fmode == 1 {
+                        // Maksimum Turbo %100
+                        dchu_send_u32(sf, 104, 100);
+                        dchu_send_u32(sf, 104, 255);
+                    } else if fmode == 2 {
+                        // Manuel % slider
+                        let man = perf.fan_manual_pct.load(Ordering::Relaxed);
+                        dchu_send_u32(sf, 104, man);
                     }
                 }
             }
 
-            // DLL guncelleme
+            // DLL güncelleme
             let dll = dll_path.lock().unwrap().clone();
             if dll != last_dll {
                 last_dll = dll.clone();
@@ -1495,37 +1568,45 @@ fn spawn_perf_thread(perf: Arc<PerfState>, dll_path: Arc<Mutex<String>>, epoch: 
                 set_fn = load_dchu_set(&dll);
             }
 
-            // SENSOR OKUMA: Dogrulanmis DCHU Kanallari
+            // SENSÖR OKUMA: Doğrulanmış DCHU Kanalları
             if let Some(f) = get_fn {
-                // Fan1Info (cmd 99) -> byte 2: CPU Sıcaklığı (°C), byte 1: CPU Fan Duty (%)
+                // Fan1Info (cmd 99) -> byte 2: CPU Sıcaklığı (°C), byte 1: CPU Fan Yükü (%)
                 if let Some(v99) = dchu_read(f, 99) {
                     let cpu_t = ((v99 >> 16) & 0xFF) as i32;
                     let cpu_d = ((v99 >> 8) & 0xFF) as i32;
                     if cpu_t > 0 && cpu_t < 115 {
                         perf.cpu_temp.store(cpu_t, Ordering::Relaxed);
                     }
-                    perf.cpu_fan_duty.store(cpu_d, Ordering::Relaxed);
+                    if cpu_d >= 0 && cpu_d <= 100 {
+                        perf.cpu_fan_duty.store(cpu_d, Ordering::Relaxed);
+                    }
                 }
 
-                // Fan2Info (cmd 100) -> byte 2: GPU Sıcaklığı (°C), byte 1: GPU Fan Duty (%)
+                // Fan2Info (cmd 100) -> byte 2: GPU Sıcaklığı (°C), byte 1: GPU Fan Yükü (%)
                 if let Some(v100) = dchu_read(f, 100) {
                     let gpu_t = ((v100 >> 16) & 0xFF) as i32;
                     let gpu_d = ((v100 >> 8) & 0xFF) as i32;
                     if gpu_t > 0 && gpu_t < 115 {
                         perf.gpu_temp_hw.store(gpu_t, Ordering::Relaxed);
                     }
-                    perf.gpu_fan_duty.store(gpu_d, Ordering::Relaxed);
+                    if gpu_d >= 0 && gpu_d <= 100 {
+                        perf.gpu_fan_duty.store(gpu_d, Ordering::Relaxed);
+                    }
                 }
 
                 // GetFan12RPM (cmd 112)
                 if let Some(v112) = dchu_read(f, 112) {
                     let f1 = (v112 & 0xFFFF) as i32;
                     let f2 = ((v112 >> 16) & 0xFFFF) as i32;
-                    perf.fan_cpu_rpm.store(f1, Ordering::Relaxed);
-                    perf.fan_gpu_rpm.store(f2, Ordering::Relaxed);
+                    if f1 > 0 && f1 < 10000 {
+                        perf.fan_cpu_rpm.store(f1, Ordering::Relaxed);
+                    }
+                    if f2 > 0 && f2 < 10000 {
+                        perf.fan_gpu_rpm.store(f2, Ordering::Relaxed);
+                    }
                 }
 
-                // Sarj durumu (cmd 119)
+                // Şarj durumu (cmd 119)
                 if let Some(cs) = dchu_read(f, 119) {
                     perf.charge_raw.store(cs, Ordering::Relaxed);
                 }
@@ -2313,7 +2394,7 @@ impl App {
         });
     }
 
-    /// Performans sekmesi: 4 Hazir Mod + ThrottleStop Tarzi Advanced Ayarlar + Dogrulanmis Canli Sensorler
+    /// Performans sekmesi: 4 Hazir Mod + ThrottleStop Tarzi Advanced Ayarlar + Dogrulanmis Canli Sensorler + Fan Kontrolu
     fn draw_perf_tab(&mut self, ctx: &egui::Context) {
         let cpu_temp     = self.perf.cpu_temp.load(Ordering::Relaxed);
         let gpu_temp_hw  = self.perf.gpu_temp_hw.load(Ordering::Relaxed);
@@ -2333,8 +2414,12 @@ impl App {
         let mut core_oc    = self.perf.gpu_core_oc.load(Ordering::Relaxed);
         let mut mem_oc     = self.perf.gpu_mem_oc.load(Ordering::Relaxed);
         let mut t_limit    = self.perf.gpu_temp_limit.load(Ordering::Relaxed);
-        let mut fan_max    = self.perf.fan_max_mode.load(Ordering::Relaxed);
+        let mut fan_m      = self.perf.fan_mode.load(Ordering::Relaxed);
+        let mut fan_man    = self.perf.fan_manual_pct.load(Ordering::Relaxed);
         let mut changed    = false;
+
+        let tstudio_found  = find_tstudio_dir().is_some();
+        let gpu_found      = find_control_gpu_exe().is_some();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2345,22 +2430,27 @@ impl App {
                     if sensor_ok {
                         ui.colored_label(Color32::from_rgb(80, 220, 120), format!("● DCHU EC Bağlı ({} sn önce güncellendi)", age_secs));
                     } else {
-                        ui.colored_label(Color32::from_rgb(255, 100, 80), "● DCHU Bağlanamadı (InsydeDCHU.dll eksik)");
+                        ui.colored_label(Color32::from_rgb(255, 100, 80), "● DCHU Bekleniyor / Bağlanamadı");
                     }
                     ui.separator();
-                    let gpu_ok = std::path::Path::new("ControlGPU.exe").exists() || find_cc40_fnkey_path().is_some();
-                    if gpu_ok {
-                        ui.colored_label(Color32::from_rgb(80, 200, 120), "● ControlGPU API Hazır");
+                    if tstudio_found {
+                        ui.colored_label(Color32::from_rgb(80, 200, 120), "● Masaüstü tstudio Bağlı");
                     } else {
-                        ui.colored_label(Color32::from_rgb(200, 150, 50), "⚠ ControlGPU.exe bulunamadı");
+                        ui.colored_label(Color32::from_rgb(200, 150, 50), "⚠ Masaüstü tstudio Bulunamadı");
+                    }
+                    ui.separator();
+                    if gpu_found {
+                        ui.colored_label(Color32::from_rgb(80, 200, 120), "● GPU API Hazır");
+                    } else {
+                        ui.colored_label(Color32::from_gray(140), "○ GPU API Yok");
                     }
                 });
                 ui.add_space(10.0);
 
                 // ============================================================
-                //  1. BÖLÜM: 4 HAZIR GÜÇ MODU
+                //  1. BÖLÜM: 4 HAZIR GÜÇ MODU (CC40 Standartları)
                 // ============================================================
-                ui.heading(egui::RichText::new("⚡ Hızlı Güç Modları (CC40 Profilleri)").color(Color32::from_rgb(255, 180, 60)));
+                ui.heading(egui::RichText::new("⚡ Hızlı Güç Modları (CC40)").color(Color32::from_rgb(255, 180, 60)));
                 ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
@@ -2374,35 +2464,35 @@ impl App {
                         preset = 0;
                         turbo = true;
                         cpu_pct = 100;
-                        fan_max = false;
+                        fan_m = 0; // Auto fan
                         changed = true;
                     }
 
                     // 2. Eğlence
                     let is_e = preset == 1;
                     let e_btn = egui::Button::new(
-                        egui::RichText::new("🎬 Eğlence\n(Dengeli & Oyun)").color(if is_e { Color32::WHITE } else { Color32::from_rgb(255, 210, 60) })
+                        egui::RichText::new("🎬 Eğlence\n(Dengeli)").color(if is_e { Color32::WHITE } else { Color32::from_rgb(255, 210, 60) })
                     ).min_size(egui::vec2(140.0, 55.0)).fill(if is_e { Color32::from_rgb(160, 130, 20) } else { Color32::from_rgb(40, 35, 15) });
 
                     if ui.add(e_btn).clicked() {
                         preset = 1;
                         turbo = true;
                         cpu_pct = 100;
-                        fan_max = false;
+                        fan_m = 0;
                         changed = true;
                     }
 
                     // 3. Sessiz
                     let is_q = preset == 2;
                     let q_btn = egui::Button::new(
-                        egui::RichText::new("🔇 Sessiz\n(Düşük Fan Sesi)").color(if is_q { Color32::WHITE } else { Color32::from_rgb(100, 200, 255) })
+                        egui::RichText::new("🔇 Sessiz\n(Sessiz Fan)").color(if is_q { Color32::WHITE } else { Color32::from_rgb(100, 200, 255) })
                     ).min_size(egui::vec2(140.0, 55.0)).fill(if is_q { Color32::from_rgb(20, 80, 140) } else { Color32::from_rgb(15, 30, 45) });
 
                     if ui.add(q_btn).clicked() {
                         preset = 2;
-                        turbo = false; // Sessiz modda fanı zorlamamak için Turbo kapalı
+                        turbo = false; // Sessiz modda Turbo kapalı (soğuk & sessiz)
                         cpu_pct = 85;
-                        fan_max = false;
+                        fan_m = 0;
                         changed = true;
                     }
 
@@ -2416,7 +2506,7 @@ impl App {
                         preset = 3;
                         turbo = false;
                         cpu_pct = 70;
-                        fan_max = false;
+                        fan_m = 0;
                         changed = true;
                     }
                 });
@@ -2425,7 +2515,59 @@ impl App {
                 ui.separator();
 
                 // ============================================================
-                //  2. BÖLÜM: THROTTLESTOP TARZI GELİŞMİŞ AYARLAR (ADVANCED)
+                //  2. BÖLÜM: FAN KONTROLÜ (RPM & % Slider & Turbo)
+                // ============================================================
+                ui.heading(egui::RichText::new("🌀 Fan Kontrolü & Ayarları").color(Color32::from_rgb(120, 220, 255)));
+                ui.add_space(4.0);
+
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Anlık Devir:").strong());
+                        if fan_cpu > 0 {
+                            ui.colored_label(Color32::from_rgb(100, 220, 255), format!("CPU: {} RPM", fan_cpu));
+                        } else {
+                            ui.label("CPU: — RPM");
+                        }
+                        ui.separator();
+                        if fan_gpu > 0 {
+                            ui.colored_label(Color32::from_rgb(130, 255, 160), format!("GPU: {} RPM", fan_gpu));
+                        } else {
+                            ui.label("GPU: — RPM");
+                        }
+                        ui.separator();
+                        ui.label(format!("Yük: CPU %{} / GPU %{}", cpu_duty.max(0), gpu_duty.max(0)));
+                    });
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Çalışma Rejimi:");
+                        if ui.selectable_value(&mut fan_m, 0, "🌀 Otomatik (Auto)").clicked() {
+                            changed = true;
+                        }
+                        if ui.selectable_value(&mut fan_m, 1, "🚀 Maksimum Turbo (%100)").clicked() {
+                            changed = true;
+                        }
+                        if ui.selectable_value(&mut fan_m, 2, "🎚️ Manuel % Slider").clicked() {
+                            changed = true;
+                        }
+                    });
+
+                    if fan_m == 2 {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Manuel Fan Hızı Limiti:");
+                            if ui.add(egui::Slider::new(&mut fan_man, 30..=100).text("%").fixed_decimals(0)).changed() {
+                                changed = true;
+                            }
+                        });
+                    }
+                });
+
+                ui.add_space(14.0);
+                ui.separator();
+
+                // ============================================================
+                //  3. BÖLÜM: THROTTLESTOP TARZI GELİŞMİŞ AYARLAR (ADVANCED)
                 // ============================================================
                 ui.heading(egui::RichText::new("🛠️ Gelişmiş Ayarlar (ThrottleStop & GPU OC/UV)").color(Color32::from_rgb(130, 200, 255)));
                 ui.add_space(4.0);
@@ -2438,9 +2580,9 @@ impl App {
                             changed = true;
                         }
                         if turbo {
-                            ui.colored_label(Color32::from_rgb(255, 150, 50), "(Aktif - 4.7 GHz'e kadar fırlar)");
+                            ui.colored_label(Color32::from_rgb(255, 150, 50), "(Aktif - Yüksek frekansa fırlar)");
                         } else {
-                            ui.colored_label(Color32::from_rgb(100, 200, 255), "(Kapalı - Taban saat hızına kilitli, soğuk ve sessiz)");
+                            ui.colored_label(Color32::from_rgb(100, 200, 255), "(Kapalı - Taban saat hızına kilitli, soğuk ve serin)");
                         }
                     });
 
@@ -2453,20 +2595,12 @@ impl App {
                             changed = true;
                         }
                     });
-
-                    ui.add_space(6.0);
-                    // Fan Turbo Modu
-                    ui.horizontal(|ui| {
-                        ui.label("Fan Çalışma Rejimi:");
-                        if ui.selectable_value(&mut fan_max, false, "🌀 Otomatik Fan").clicked() { changed = true; }
-                        if ui.selectable_value(&mut fan_max, true, "🚀 Maksimum Fan (Turbo 100%)").clicked() { changed = true; }
-                    });
                 });
 
                 ui.add_space(8.0);
                 // GPU Overclock / Undervolt Grubu
                 ui.group(|ui| {
-                    ui.label(egui::RichText::new("🎮 NVIDIA GPU Frekans & Sıcaklık Limiti (ControlGPU)").strong());
+                    ui.label(egui::RichText::new("🎮 NVIDIA GPU Frekans & Sıcaklık Limiti").strong());
                     ui.add_space(4.0);
 
                     ui.horizontal(|ui| {
@@ -2510,7 +2644,8 @@ impl App {
                     self.perf.gpu_core_oc.store(core_oc, Ordering::Relaxed);
                     self.perf.gpu_mem_oc.store(mem_oc, Ordering::Relaxed);
                     self.perf.gpu_temp_limit.store(t_limit, Ordering::Relaxed);
-                    self.perf.fan_max_mode.store(fan_max, Ordering::Relaxed);
+                    self.perf.fan_mode.store(fan_m, Ordering::Relaxed);
+                    self.perf.fan_manual_pct.store(fan_man, Ordering::Relaxed);
                     self.perf.apply_req.store(true, Ordering::Relaxed);
                 }
 
@@ -2518,9 +2653,9 @@ impl App {
                 ui.separator();
 
                 // ============================================================
-                //  3. BÖLÜM: GERÇEK ZAMANLI DONANIM SENSÖRLERİ (DOGRU EC VERİSİ)
+                //  4. BÖLÜM: GERÇEK ZAMANLI DONANIM SENSÖRLERİ (DOĞRU EC VERİSİ)
                 // ============================================================
-                ui.heading(egui::RichText::new("🌡️ Canlı Donanım Sensörleri (EC / DCHU Doğrulanmış)").color(Color32::from_rgb(90, 220, 150)));
+                ui.heading(egui::RichText::new("🌡️ Canlı Donanım Sensörleri (DCHU EC)").color(Color32::from_rgb(90, 220, 150)));
                 ui.add_space(6.0);
 
                 egui::Grid::new("hw_sensors_grid").num_columns(3).spacing([24.0, 8.0]).show(ui, |ui| {
@@ -2531,7 +2666,7 @@ impl App {
                     } else {
                         ui.colored_label(Color32::from_gray(100), "Okunuyor...");
                     }
-                    ui.label(egui::RichText::new(format!("Fan Yükü: %{}", cpu_duty.max(0))).small().color(Color32::from_gray(120)));
+                    ui.label(egui::RichText::new(format!("Fan: %{}", cpu_duty.max(0))).small().color(Color32::from_gray(120)));
                     ui.end_row();
 
                     // GPU Sıcaklığı
@@ -2541,35 +2676,35 @@ impl App {
                     } else {
                         ui.colored_label(Color32::from_gray(100), "Okunuyor...");
                     }
-                    ui.label(egui::RichText::new(format!("Fan Yükü: %{}", gpu_duty.max(0))).small().color(Color32::from_gray(120)));
+                    ui.label(egui::RichText::new(format!("Fan: %{}", gpu_duty.max(0))).small().color(Color32::from_gray(120)));
                     ui.end_row();
 
                     // CPU Fan Hızı
                     ui.label(egui::RichText::new("CPU Fan Devri").color(Color32::from_gray(210)));
                     if fan_cpu > 0 {
-                        ui.label(format!("{} RPM", fan_cpu * 10));
+                        ui.label(format!("{} RPM", fan_cpu));
                     } else {
                         ui.colored_label(Color32::from_gray(100), "—");
                     }
-                    ui.label(egui::RichText::new("EC Fan #1").small().color(Color32::from_gray(120)));
+                    ui.label(egui::RichText::new("Fan #1 (CPU)").small().color(Color32::from_gray(120)));
                     ui.end_row();
 
                     // GPU Fan Hızı
                     ui.label(egui::RichText::new("GPU Fan Devri").color(Color32::from_gray(210)));
                     if fan_gpu > 0 {
-                        ui.label(format!("{} RPM", fan_gpu * 10));
+                        ui.label(format!("{} RPM", fan_gpu));
                     } else {
                         ui.colored_label(Color32::from_gray(100), "—");
                     }
-                    ui.label(egui::RichText::new("EC Fan #2").small().color(Color32::from_gray(120)));
+                    ui.label(egui::RichText::new("Fan #2 (GPU)").small().color(Color32::from_gray(120)));
                     ui.end_row();
 
                     // Şarj Durumu
-                    ui.label(egui::RichText::new("Şarj / Güç").color(Color32::from_gray(210)));
+                    ui.label(egui::RichText::new("Güç Durumu").color(Color32::from_gray(210)));
                     if charge_raw >= 0 {
                         let state = match (charge_raw >> 16) & 0xFF {
                             1 => "⚡ Şarj Ediliyor",
-                            2 => "🔋 Dolu",
+                            2 => "🔋 Pil Dolu",
                             _ => "🔌 Fişe Takılı",
                         };
                         ui.label(state);
@@ -2583,7 +2718,7 @@ impl App {
                 ui.add_space(14.0);
                 ui.separator();
                 ui.label(egui::RichText::new(
-                    "💡 İpucu: Güç tasarrufu modundayken veya pildeyken 'CPU Turbo Boost' seçeneğini kapatarak ekstra pil ömrü ve serin çalışma sağlayabilirsiniz."
+                    "💡 tstudio Entegrasyonu: DLL ve EXE dosyaları doğrudan masaüstündeki tstudio klasöründen dinamik olarak okunur. Repoya harici ikili dosya eklenmesine gerek yoktur."
                 ).small().color(Color32::from_gray(140)));
             });
         });
