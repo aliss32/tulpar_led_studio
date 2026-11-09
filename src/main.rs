@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 //! Tulpar LED Studio - Tulpar T5 V23.4 tek bolgeli klavye icin efekt programi.
 //! InsydeDCHU.dll -> SetDCHU_Data(103, ...) yolunu kullanir (tulpar_led.ps1 ile ayni yontem).
+//! Performans sekmesi: cc30wk.exe araciligiyla CPU guc modu, DCHU ile fan/sicaklik okuma.
 
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
@@ -9,7 +10,7 @@ use std::f64::consts::PI;
 use std::ffi::c_void;
 use std::os::windows::process::CommandExt;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1285,6 +1286,197 @@ fn start_audio(sens: Arc<Sensors>) {
 }
 
 // ============================================================================
+//  Performans altyapisi
+// ============================================================================
+
+/// CPU guc modu: cc30wk.exe 0x0013 <deger> ile set edilir.
+/// 0 = Performans (Turbo acik), 1 = Sessiz/Guc Tasarrufu (Turbo kapali)
+/// 2 = Eglence, 3 = Dengeli (deneysel - dogrulanmamis)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+enum CpuPowerMode {
+    Performance = 0,  // cc30wk 0x0013 0
+    Silent      = 1,  // cc30wk 0x0013 1
+    // Asagidakiler deneysel; sadece 0 ve 1 kesinlesti (Tulpar_Izle.txt)
+    // Entertainment = 2,
+    // Balanced = 3,
+}
+
+/// DCHU salt-okuma: GetDCHU_Data_Integer
+type GetDataIntFn = unsafe extern "C" fn(i32, *mut i32) -> i32;
+
+/// InsydeDCHU.dll'den GetDCHU_Data_Integer fonksiyon adresini alir.
+fn load_dchu_get(dll_path: &str) -> Option<GetDataIntFn> {
+    unsafe {
+        let w = wide(dll_path);
+        let h = LoadLibraryW(w.as_ptr());
+        if h.is_null() { return None; }
+        let p = GetProcAddress(h, b"GetDCHU_Data_Integer\0".as_ptr());
+        if p.is_null() { return None; }
+        Some(std::mem::transmute::<*mut c_void, GetDataIntFn>(p))
+    }
+}
+
+/// DCHU oku: 0 veya pozitif -> deger, hata kodu -> None
+fn dchu_read(f: GetDataIntFn, cmd: i32) -> Option<i32> {
+    let mut v: i32 = 0;
+    let r = unsafe { f(cmd, &mut v) };
+    // -2147483646 (0x80000002) = "desteklenmiyor/hazir degil"
+    if r == 0 && v != -2147483646i32 { Some(v) } else { None }
+}
+
+/// cc30wk.exe ile CPU guc modunu degistirir.
+/// Bu fonksiyon bloke eden bir alt surec baslatir; arkaplan thread'inde cagir.
+fn cc30wk_set_mode(cc40_path: &str, mode: CpuPowerMode) -> bool {
+    let exe = format!("{}\\cc30wk.exe", cc40_path);
+    let arg = format!("{}", mode as u32);
+    let r = std::process::Command::new(&exe)
+        .args(["0x0013", &arg])
+        .creation_flags(0x0800_0000)  // CREATE_NO_WINDOW
+        .status();
+    matches!(r, Ok(s) if s.success())
+}
+
+/// Performans sekmesi icin paylasilan durum (arkaplan thread'i + GUI arasi)
+struct PerfState {
+    /// Son okunan CPU sicakligi (GetCPUtemp, cmd 1), -1 = bilinmiyor
+    cpu_temp:    AtomicI32,
+    /// Son okunan GPU sicakligi (GetVGA1temp, cmd 12), -1 = bilinmiyor
+    gpu_temp_hw: AtomicI32,
+    /// Son okunan CPU fan devri (GetFan12RPM ust 16 bit), -1 = bilinmiyor
+    fan_cpu_rpm: AtomicI32,
+    /// Son okunan GPU fan devri (GetFan12RPM alt 16 bit), -1 = bilinmiyor
+    fan_gpu_rpm: AtomicI32,
+    /// Fan calisiyor mu? (GetFanStatus cmd 97)
+    fan_status:  AtomicI32,
+    /// Sarj durumu (GetChargingStatus cmd 119)
+    charge_raw:  AtomicI32,
+    /// Mod degistirme istegi: 0=yok, 1=Performans, 2=Sessiz
+    mode_req:    AtomicU8,
+    /// Son uygulanan mod: 0=bilinmiyor, 1=Performans, 2=Sessiz
+    mode_cur:    AtomicU8,
+    /// Sensor thread'i calisip calismadigini bildir
+    sensor_ok:   AtomicBool,
+    /// Mod degistirme islemi devam ediyor mu?
+    mode_busy:   AtomicBool,
+    /// Son sensor okuma zamani (epoch'tan ms)
+    last_read_ms: AtomicU64,
+}
+
+impl PerfState {
+    fn new() -> PerfState {
+        PerfState {
+            cpu_temp:    AtomicI32::new(-1),
+            gpu_temp_hw: AtomicI32::new(-1),
+            fan_cpu_rpm: AtomicI32::new(-1),
+            fan_gpu_rpm: AtomicI32::new(-1),
+            fan_status:  AtomicI32::new(-1),
+            charge_raw:  AtomicI32::new(-1),
+            mode_req:    AtomicU8::new(0),
+            mode_cur:    AtomicU8::new(0),
+            sensor_ok:   AtomicBool::new(false),
+            mode_busy:   AtomicBool::new(false),
+            last_read_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+/// CC40 kurulum yolunu bul (WindowsApps altindaki paket)
+fn find_cc40_fnkey_path() -> Option<String> {
+    // Bilinen yol - su anki CC40 surumu
+    let known = "C:\\Program Files\\WindowsApps\\CLEVOCO.FnhotkeysandOSD_7.101.0.0_x64__6h6z29zh29qx0\\FnKey";
+    if std::path::Path::new(known).join("cc30wk.exe").exists() {
+        return Some(known.to_string());
+    }
+    // Paket adi degismisse dinamik ara
+    if let Ok(entries) = std::fs::read_dir("C:\\Program Files\\WindowsApps") {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let n = name.to_string_lossy();
+            if n.starts_with("CLEVOCO.") && n.contains("Fnhot") {
+                let p = e.path().join("FnKey");
+                if p.join("cc30wk.exe").exists() {
+                    return Some(p.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Arkaplan thread'i: DCHU sensorlerini periyodik okur + mod degistirme isteklerini isler
+fn spawn_perf_thread(perf: Arc<PerfState>, dll_path: Arc<Mutex<String>>, epoch: Instant) {
+    std::thread::spawn(move || {
+        let cc40 = find_cc40_fnkey_path().unwrap_or_default();
+        let mut last_dll = String::new();
+        let mut get_fn: Option<GetDataIntFn> = None;
+
+        loop {
+            // Mod degistirme istegi var mi?
+            let req = perf.mode_req.load(Ordering::Relaxed);
+            if req != 0 {
+                perf.mode_req.store(0, Ordering::Relaxed);
+                perf.mode_busy.store(true, Ordering::Relaxed);
+                let mode = if req == 1 { CpuPowerMode::Performance } else { CpuPowerMode::Silent };
+                if !cc40.is_empty() {
+                    cc30wk_set_mode(&cc40, mode);
+                    perf.mode_cur.store(req, Ordering::Relaxed);
+                }
+                perf.mode_busy.store(false, Ordering::Relaxed);
+            }
+
+            // DLL yolu degistiyse yeniden yukle
+            let dll = dll_path.lock().unwrap().clone();
+            if dll != last_dll {
+                last_dll = dll.clone();
+                get_fn = load_dchu_get(&dll);
+            }
+
+            // Sensorleri oku
+            if let Some(f) = get_fn {
+                // CPU sicakligi - cmd 1 (daha guvenilir)
+                let cpu_t = dchu_read(f, 1).unwrap_or(-1);
+                perf.cpu_temp.store(cpu_t, Ordering::Relaxed);
+
+                // GPU sicakligi - cmd 12 (VGA1temp)
+                let gpu_t = dchu_read(f, 12).unwrap_or(-1);
+                perf.gpu_temp_hw.store(gpu_t, Ordering::Relaxed);
+
+                // Fan RPM - cmd 112: ust 16 bit = fan1 (CPU), alt 16 bit = fan2 (GPU)
+                if let Some(rpm_raw) = dchu_read(f, 112) {
+                    let r = rpm_raw as u32;
+                    perf.fan_cpu_rpm.store(((r >> 16) & 0xFFFF) as i32, Ordering::Relaxed);
+                    perf.fan_gpu_rpm.store((r & 0xFFFF) as i32, Ordering::Relaxed);
+                } else {
+                    // Fallback: ayri cmd'ler (fan1info cmd 99)
+                    let f1 = dchu_read(f, 99).map(|v| {
+                        // Fan1Info: [RPM_HI][RPM_LO][dutcy][?] - onceki kesiflerden
+                        let r = v as u32;
+                        ((r >> 16) & 0xFF) as i32 * 100 + ((r >> 8) & 0xFF) as i32
+                    }).unwrap_or(-1);
+                    perf.fan_cpu_rpm.store(f1, Ordering::Relaxed);
+                }
+
+                // Fan durumu - cmd 97
+                let fs = dchu_read(f, 97).unwrap_or(-1);
+                perf.fan_status.store(fs, Ordering::Relaxed);
+
+                // Sarj durumu - cmd 119
+                let cs = dchu_read(f, 119).unwrap_or(-1);
+                perf.charge_raw.store(cs, Ordering::Relaxed);
+
+                perf.sensor_ok.store(true, Ordering::Relaxed);
+                perf.last_read_ms.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+            } else {
+                perf.sensor_ok.store(false, Ordering::Relaxed);
+            }
+
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+    });
+}
+
+// ============================================================================
 //  LED surucusu (InsydeDCHU.dll)
 // ============================================================================
 
@@ -1924,80 +2116,13 @@ fn key_panel(ui: &mut egui::Ui, s: &mut Settings, show_hold: bool) {
     }
 }
 
-struct App {
-    settings: Settings,
-    shared: Arc<Mutex<Settings>>,
-    status: Arc<Mutex<Status>>,
-    t0: Instant,
-    saved_text: String,
-}
+/// Hangi ana sekme secili?
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab { Led, Perf }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let t = self.t0.elapsed().as_secs_f64();
-        let st = self.status.lock().unwrap().clone();
-        let dirty = self.settings.to_text() != self.saved_text;
-
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.heading(
-                    egui::RichText::new("TULPAR LED STUDIO")
-                        .color(Color32::from_rgb(130, 200, 255))
-                        .strong(),
-                );
-                ui.label(
-                    egui::RichText::new("tek bölgeli klavye efekt merkezi")
-                        .color(Color32::from_gray(140)),
-                );
-            });
-            ui.add_space(4.0);
-            draw_keyboard(ui, st.color);
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.settings.on, "Işık açık");
-                ui.add(
-                    egui::Slider::new(&mut self.settings.brightness, 0.05..=1.0)
-                        .text("Parlaklık")
-                        .fixed_decimals(2),
-                );
-                ui.separator();
-                if ui.button("Kaydet").clicked() {
-                    self.settings.save();
-                    self.saved_text = self.settings.to_text();
-                }
-                if dirty {
-                    ui.colored_label(
-                        Color32::from_rgb(255, 200, 90),
-                        "● kaydedilmemiş değişiklik var",
-                    );
-                } else {
-                    ui.colored_label(Color32::from_gray(130), "✓ kaydedildi (program bu ayarla açılır)");
-                }
-            });
-            ui.add_space(6.0);
-        });
-
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if st.error.is_empty() {
-                    ui.colored_label(Color32::from_rgb(110, 220, 130), "● LED bağlı");
-                    ui.label(format!("gönderim {:.1} ms", st.send_ms));
-                } else {
-                    ui.colored_label(Color32::from_rgb(255, 100, 100), format!("● {}", st.error));
-                }
-                ui.separator();
-                ui.label(&st.info);
-                ui.separator();
-                ui.label(format!(
-                    "#{:02X}{:02X}{:02X}",
-                    st.color[0], st.color[1], st.color[2]
-                ));
-            });
-            ui.add_space(4.0);
-        });
-
+impl App {
+    /// LED sekmesi: sag panel + merkez kartlar (orijinal yerlesim)
+    fn draw_led_tab(&mut self, ctx: &egui::Context, t: f64) {
         egui::SidePanel::right("opts").min_width(300.0).show(ctx, |ui| {
             ui.add_space(8.0);
             let m = self.settings.mode;
@@ -2011,10 +2136,7 @@ impl eframe::App for App {
             ui.separator();
 
             if m == Mode::Combine {
-                ui.label(
-                    egui::RichText::new("Birlikte çalışacak katmanları tikle:")
-                        .color(Color32::from_gray(170)),
-                );
+                ui.label(egui::RichText::new("Birlikte çalışacak katmanları tikle:").color(Color32::from_gray(170)));
                 ui.add_space(4.0);
                 ui.checkbox(&mut self.settings.cmb_bg, "Arka plan katmanı (tuşa basılmazken)");
                 if self.settings.cmb_bg {
@@ -2028,26 +2150,17 @@ impl eframe::App for App {
                 }
                 ui.add_space(6.0);
                 ui.checkbox(&mut self.settings.cmb_keys, "Tuş katmanı (yazarken devreye girer)");
-                if self.settings.cmb_keys {
-                    key_panel(ui, &mut self.settings, true);
-                }
+                if self.settings.cmb_keys { key_panel(ui, &mut self.settings, true); }
                 ui.add_space(6.0);
                 ui.checkbox(&mut self.settings.cmb_caps, "Caps Lock katmanı");
                 if self.settings.cmb_caps {
                     ui.label("Caps rengi");
                     hue_slider(ui, &mut self.settings.caps_hue);
-                    ui.add(
-                        egui::Slider::new(&mut self.settings.caps_strength, 10.0..=100.0)
-                            .text("Renk gücü %")
-                            .fixed_decimals(0),
-                    );
+                    ui.add(egui::Slider::new(&mut self.settings.caps_strength, 10.0..=100.0).text("Renk gücü %").fixed_decimals(0));
                 }
                 if self.settings.cmb_bg {
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!("Arka plan ayarları: {}", eff.name())).strong(),
-                    );
+                    ui.add_space(6.0); ui.separator();
+                    ui.label(egui::RichText::new(format!("Arka plan ayarları: {}", eff.name())).strong());
                     ui.add_space(4.0);
                 }
             } else if m == Mode::KeyFlash {
@@ -2068,81 +2181,39 @@ impl eframe::App for App {
 
             match eff {
                 Mode::System => {
-                    let label = match self.settings.sys_src {
-                        SysSrc::Cpu => "CPU yükü",
-                        SysSrc::Ram => "RAM kullanımı",
-                        SysSrc::Gpu => "GPU sıcaklığı",
-                    };
-                    egui::ComboBox::from_label("Kaynak")
-                        .selected_text(label)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.settings.sys_src, SysSrc::Cpu, "CPU yükü");
-                            ui.selectable_value(&mut self.settings.sys_src, SysSrc::Ram, "RAM kullanımı");
-                            ui.selectable_value(&mut self.settings.sys_src, SysSrc::Gpu, "GPU sıcaklığı (nvidia-smi)");
-                        });
+                    let label = match self.settings.sys_src { SysSrc::Cpu => "CPU yükü", SysSrc::Ram => "RAM kullanımı", SysSrc::Gpu => "GPU sıcaklığı" };
+                    egui::ComboBox::from_label("Kaynak").selected_text(label).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.settings.sys_src, SysSrc::Cpu, "CPU yükü");
+                        ui.selectable_value(&mut self.settings.sys_src, SysSrc::Ram, "RAM kullanımı");
+                        ui.selectable_value(&mut self.settings.sys_src, SysSrc::Gpu, "GPU sıcaklığı (nvidia-smi)");
+                    });
                     ui.label("Mavi = düşük, kırmızı = yüksek.");
                 }
                 Mode::IdleActive => {
-                    ui.add(
-                        egui::Slider::new(&mut self.settings.idle_breathe_after, 2.0..=120.0)
-                            .text("Nefese geç (sn)"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.settings.idle_off_after, 10.0..=1800.0)
-                            .logarithmic(true)
-                            .text("Sön (sn)"),
-                    );
+                    ui.add(egui::Slider::new(&mut self.settings.idle_breathe_after, 2.0..=120.0).text("Nefese geç (sn)"));
+                    ui.add(egui::Slider::new(&mut self.settings.idle_off_after, 10.0..=1800.0).logarithmic(true).text("Sön (sn)"));
                 }
                 Mode::Music => {
-                    ui.add(
-                        egui::Slider::new(&mut self.settings.music_gain, 1.0..=12.0).text("Hassasiyet"),
-                    );
+                    ui.add(egui::Slider::new(&mut self.settings.music_gain, 1.0..=12.0).text("Hassasiyet"));
                     ui.label("Sistemden çalan sesi dinler (YouTube, Spotify...).");
                 }
                 Mode::Screen => {
-                    ui.add(
-                        egui::Slider::new(&mut self.settings.screen_strip, 4.0..=40.0)
-                            .text("Şerit yüksekliği %"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.settings.screen_vivid, 1.0..=3.0)
-                            .text("Canlılık"),
-                    );
+                    ui.add(egui::Slider::new(&mut self.settings.screen_strip, 4.0..=40.0).text("Şerit yüksekliği %"));
+                    ui.add(egui::Slider::new(&mut self.settings.screen_vivid, 1.0..=3.0).text("Canlılık"));
                     ui.label("Birincil monitörün alt şeridi okunur.");
-                    ui.checkbox(
-                        &mut self.settings.screen_adapt,
-                        "Ekran parlaklığına göre ışığı ayarla",
-                    );
+                    ui.checkbox(&mut self.settings.screen_adapt, "Ekran parlaklığına göre ışığı ayarla");
                     if self.settings.screen_adapt {
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.screen_min, 0.0..=40.0)
-                                .text("En düşük parlaklık % (siyahta)")
-                                .fixed_decimals(0),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.screen_gamma, 1.0..=3.0)
-                                .text("Koyu renk bastırma")
-                                .fixed_decimals(1),
-                        );
-                        ui.label(
-                            egui::RichText::new(
-                                "Siyah ve koyu bordo gibi renklerde ışık kısılır, açık ve cırtlak renklerde parlar.",
-                            )
-                            .small()
-                            .color(Color32::from_gray(130)),
-                        );
+                        ui.add(egui::Slider::new(&mut self.settings.screen_min, 0.0..=40.0).text("En düşük parlaklık % (siyahta)").fixed_decimals(0));
+                        ui.add(egui::Slider::new(&mut self.settings.screen_gamma, 1.0..=3.0).text("Koyu renk bastırma").fixed_decimals(1));
+                        ui.label(egui::RichText::new("Siyah ve koyu bordo gibi renklerde ışık kısılır, açık ve cırtlak renklerde parlar.").small().color(Color32::from_gray(130)));
                     }
                 }
                 Mode::Pomodoro => {
                     ui.add(egui::Slider::new(&mut self.settings.pomo_work, 1.0..=90.0).text("Çalışma dk"));
                     ui.add(egui::Slider::new(&mut self.settings.pomo_break, 1.0..=30.0).text("Mola dk"));
                     ui.horizontal(|ui| {
-                        if ui.button("▶ Başlat").clicked() {
-                            self.settings.pomo_start_nonce += 1;
-                        }
-                        if ui.button("■ Sıfırla").clicked() {
-                            self.settings.pomo_reset_nonce += 1;
-                        }
+                        if ui.button("▶ Başlat").clicked() { self.settings.pomo_start_nonce += 1; }
+                        if ui.button("■ Sıfırla").clicked() { self.settings.pomo_reset_nonce += 1; }
                     });
                 }
                 Mode::Ping => {
@@ -2156,11 +2227,12 @@ impl eframe::App for App {
             ui.separator();
             ui.label(egui::RichText::new("InsydeDCHU.dll yolu").color(Color32::from_gray(150)));
             ui.text_edit_singleline(&mut self.settings.dll_path);
-            ui.label(
-                egui::RichText::new("Control Center / CC40 kapalı olmalı.")
-                    .small()
-                    .color(Color32::from_gray(120)),
-            );
+            // DLL yolu degisince perf thread'ine bildir
+            {
+                let mut shared_dll = self.perf_dll_path.lock().unwrap();
+                if *shared_dll != self.settings.dll_path { *shared_dll = self.settings.dll_path.clone(); }
+            }
+            ui.label(egui::RichText::new("Control Center / CC40 kapalı olmalı.").small().color(Color32::from_gray(120)));
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2169,13 +2241,302 @@ impl eframe::App for App {
                 ui.horizontal_wrapped(|ui| {
                     for m in Mode::ALL.iter() {
                         let selected = self.settings.mode == *m;
-                        if draw_card(ui, *m, selected, &self.settings, t) {
-                            self.settings.mode = *m;
-                        }
+                        if draw_card(ui, *m, selected, &self.settings, t) { self.settings.mode = *m; }
                     }
                 });
             });
         });
+    }
+
+    /// Performans sekmesi: CPU guc modu, sicaklik, fan bilgisi
+    fn draw_perf_tab(&mut self, ctx: &egui::Context) {
+        let cpu_temp    = self.perf.cpu_temp.load(Ordering::Relaxed);
+        let gpu_temp_hw = self.perf.gpu_temp_hw.load(Ordering::Relaxed);
+        let fan_cpu     = self.perf.fan_cpu_rpm.load(Ordering::Relaxed);
+        let fan_gpu     = self.perf.fan_gpu_rpm.load(Ordering::Relaxed);
+        let fan_status  = self.perf.fan_status.load(Ordering::Relaxed);
+        let charge_raw  = self.perf.charge_raw.load(Ordering::Relaxed);
+        let sensor_ok   = self.perf.sensor_ok.load(Ordering::Relaxed);
+        let mode_cur    = self.perf.mode_cur.load(Ordering::Relaxed);
+        let mode_busy   = self.perf.mode_busy.load(Ordering::Relaxed);
+        let age_ms      = self.epoch.elapsed().as_millis() as u64;
+        let last_read   = self.perf.last_read_ms.load(Ordering::Relaxed);
+        let age_secs    = if last_read == 0 { 999u64 } else { (age_ms.saturating_sub(last_read)) / 1000 };
+        let cc40_found  = find_cc40_fnkey_path().is_some();
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_space(8.0);
+
+                // Durum cubugu
+                ui.horizontal(|ui| {
+                    if sensor_ok {
+                        ui.colored_label(Color32::from_rgb(80, 220, 120), format!("● DCHU bağlı  ({} sn önce güncellendi)", age_secs));
+                    } else {
+                        ui.colored_label(Color32::from_rgb(255, 100, 80), "● DCHU bağlanamadı (DLL yolu?)");
+                    }
+                    ui.separator();
+                    if cc40_found {
+                        ui.colored_label(Color32::from_rgb(80, 200, 120), "● CC40 bulundu");
+                    } else {
+                        ui.colored_label(Color32::from_rgb(200, 150, 50), "⚠ CC40 bulunamadı");
+                    }
+                });
+                ui.add_space(12.0);
+
+                // CPU GUC MODU
+                ui.heading(egui::RichText::new("⚡ CPU Güç Modu").color(Color32::from_rgb(255, 180, 60)));
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("cc30wk.exe aracılığıyla Tulpar CC40 ile aynı yolu kullanır.").color(Color32::from_gray(150)).small());
+                ui.add_space(8.0);
+
+                let cur_label = match mode_cur {
+                    1 => ("⚡ Performans (Turbo Açık)", Color32::from_rgb(255, 160, 40)),
+                    2 => ("🔇 Sessiz / Güç Tasarrufu (Turbo Kapalı)", Color32::from_rgb(80, 180, 255)),
+                    _ => ("? Bilinmiyor (henüz seçilmedi)", Color32::from_gray(150)),
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Son uygulanan mod:");
+                    ui.colored_label(cur_label.1, cur_label.0);
+                    if mode_busy { ui.colored_label(Color32::from_rgb(255, 220, 60), " ⟳ uygulanıyor..."); }
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let enabled = cc40_found && !mode_busy;
+                    ui.add_enabled_ui(enabled, |ui| {
+                        if ui.add(
+                            egui::Button::new(egui::RichText::new("⚡  Performans\n    (Turbo Açık)").color(Color32::from_rgb(255, 160, 40)))
+                                .min_size(egui::vec2(170.0, 60.0))
+                                .fill(Color32::from_rgb(45, 30, 10))
+                        ).clicked() {
+                            // cc30wk 0x0013 0
+                            self.perf.mode_req.store(1, Ordering::Relaxed);
+                        }
+                        ui.add_space(8.0);
+                        if ui.add(
+                            egui::Button::new(egui::RichText::new("🔇  Sessiz / Güç Tasarrufu\n    (Turbo Kapalı)").color(Color32::from_rgb(80, 180, 255)))
+                                .min_size(egui::vec2(210.0, 60.0))
+                                .fill(Color32::from_rgb(10, 25, 45))
+                        ).clicked() {
+                            // cc30wk 0x0013 1
+                            self.perf.mode_req.store(2, Ordering::Relaxed);
+                        }
+                    });
+                    if !cc40_found {
+                        ui.colored_label(Color32::from_rgb(200, 150, 50), " CC40 paketi bulunamadı");
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(
+                    "⚠ Dikkat: Bu değişiklik CC40'ı atlar. \
+                     CC40 açıksa kendi modunu tekrar yazabilir. \
+                     Kalıcı etki için CC40'ı kapatın veya eş zamanlı çalıştırmayın."
+                ).small().color(Color32::from_rgb(200, 150, 50)));
+
+                ui.add_space(16.0);
+                ui.separator();
+
+                // DONANIM SENSORLERI
+                ui.add_space(8.0);
+                ui.heading(egui::RichText::new("🌡 Donanım Sensörleri").color(Color32::from_rgb(90, 220, 150)));
+                ui.add_space(8.0);
+
+                egui::Grid::new("hw_sensors").num_columns(3).spacing([20.0, 8.0]).show(ui, |ui| {
+                    ui.label(egui::RichText::new("CPU Sıcaklığı").color(Color32::from_gray(200)));
+                    if cpu_temp >= 0 {
+                        ui.colored_label(temp_color(cpu_temp), format!("{} °C", cpu_temp));
+                    } else { ui.colored_label(Color32::from_gray(100), "—"); }
+                    ui.label(egui::RichText::new("DCHU cmd 1").small().color(Color32::from_gray(90)));
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("GPU Sıcaklığı (HW)").color(Color32::from_gray(200)));
+                    if gpu_temp_hw >= 0 {
+                        ui.colored_label(temp_color(gpu_temp_hw), format!("{} °C", gpu_temp_hw));
+                    } else { ui.colored_label(Color32::from_gray(100), "—"); }
+                    ui.label(egui::RichText::new("DCHU cmd 12").small().color(Color32::from_gray(90)));
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("CPU Fan Hızı").color(Color32::from_gray(200)));
+                    if fan_cpu > 0 { ui.label(format!("{} RPM", fan_cpu)); }
+                    else { ui.colored_label(Color32::from_gray(100), "—"); }
+                    ui.label(egui::RichText::new("DCHU cmd 112 (hi 16-bit)").small().color(Color32::from_gray(90)));
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("GPU Fan Hızı").color(Color32::from_gray(200)));
+                    if fan_gpu > 0 { ui.label(format!("{} RPM", fan_gpu)); }
+                    else { ui.colored_label(Color32::from_gray(100), "—"); }
+                    ui.label(egui::RichText::new("DCHU cmd 112 (lo 16-bit)").small().color(Color32::from_gray(90)));
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("Fan Durumu").color(Color32::from_gray(200)));
+                    if fan_status >= 0 { ui.label(format!("0x{:04X}", fan_status)); }
+                    else { ui.colored_label(Color32::from_gray(100), "—"); }
+                    ui.label(egui::RichText::new("DCHU cmd 97").small().color(Color32::from_gray(90)));
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("Şarj Durumu").color(Color32::from_gray(200)));
+                    if charge_raw >= 0 {
+                        ui.label(format!("0x{:06X}", charge_raw));
+                    } else { ui.colored_label(Color32::from_gray(100), "—"); }
+                    ui.label(egui::RichText::new("DCHU cmd 119").small().color(Color32::from_gray(90)));
+                    ui.end_row();
+                });
+
+                ui.add_space(16.0);
+                ui.separator();
+
+                // Yollar
+                ui.add_space(8.0);
+                ui.heading(egui::RichText::new("📁 Yollar").color(Color32::from_gray(170)));
+                ui.add_space(4.0);
+                match find_cc40_fnkey_path() {
+                    Some(p) => { ui.label(format!("CC40 FnKey: {}", p)); }
+                    None => {
+                        ui.colored_label(Color32::from_rgb(200, 150, 50), "CC40 FnKey klasörü bulunamadı.");
+                        ui.label(egui::RichText::new("Beklenen: ...\\WindowsApps\\CLEVOCO.FnhotkeysandOSD_...\\FnKey").small().color(Color32::from_gray(120)));
+                    }
+                }
+                ui.label(format!("DCHU DLL: {}", self.settings.dll_path));
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new(
+                    "ℹ DCHU cmd 29 (SetCPUPerformance) gelecekte deneysel turbo on/off için eklenebilir.\n\
+                     ℹ XTU (IntelOverclockingSDK) bu sistem için IPF uyumsuzluğu nedeniyle devre dışı (Kesif 4)."
+                ).small().color(Color32::from_gray(100)));
+            });
+        });
+    }
+}
+
+/// Sıcaklığa göre renk: soğuk=mavi, orta=sarı, sıcak=kırmızı
+fn temp_color(t: i32) -> Color32 {
+    if t < 50 { Color32::from_rgb(80, 180, 255) }
+    else if t < 70 { Color32::from_rgb(255, 220, 60) }
+    else if t < 85 { Color32::from_rgb(255, 140, 40) }
+    else { Color32::from_rgb(255, 70, 70) }
+}
+
+struct App {
+    settings: Settings,
+    shared: Arc<Mutex<Settings>>,
+    status: Arc<Mutex<Status>>,
+    t0: Instant,
+    saved_text: String,
+    // Aktif sekme
+    tab: Tab,
+    // Performans altyapisi
+    perf: Arc<PerfState>,
+    perf_dll_path: Arc<Mutex<String>>,
+    epoch: Instant,
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let t = self.t0.elapsed().as_secs_f64();
+        let st = self.status.lock().unwrap().clone();
+        let dirty = self.settings.to_text() != self.saved_text;
+
+        // ----------------------------------------------------------------
+        //  UST PANEL: baslik + klavye + sekme secimi
+        // ----------------------------------------------------------------
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.heading(
+                    egui::RichText::new("TULPAR LED STUDIO")
+                        .color(Color32::from_rgb(130, 200, 255))
+                        .strong(),
+                );
+                ui.label(
+                    egui::RichText::new("tek bölgeli klavye + performans merkezi")
+                        .color(Color32::from_gray(140)),
+                );
+            });
+            ui.add_space(4.0);
+            draw_keyboard(ui, st.color);
+            ui.add_space(6.0);
+
+            // Sekme butonlari
+            ui.horizontal(|ui| {
+                let led_btn = egui::Button::new(
+                    egui::RichText::new("💡  LED Efektleri").color(
+                        if self.tab == Tab::Led { Color32::from_rgb(130, 200, 255) }
+                        else { Color32::from_gray(180) }
+                    )
+                ).fill(
+                    if self.tab == Tab::Led { Color32::from_rgb(28, 40, 60) }
+                    else { Color32::from_rgb(20, 20, 28) }
+                );
+                if ui.add(led_btn).clicked() { self.tab = Tab::Led; }
+
+                let perf_btn = egui::Button::new(
+                    egui::RichText::new("⚡  Performans").color(
+                        if self.tab == Tab::Perf { Color32::from_rgb(255, 180, 60) }
+                        else { Color32::from_gray(180) }
+                    )
+                ).fill(
+                    if self.tab == Tab::Perf { Color32::from_rgb(50, 36, 10) }
+                    else { Color32::from_rgb(20, 20, 28) }
+                );
+                if ui.add(perf_btn).clicked() { self.tab = Tab::Perf; }
+
+                ui.separator();
+                if self.tab == Tab::Led {
+                    ui.checkbox(&mut self.settings.on, "Işık açık");
+                    ui.add(
+                        egui::Slider::new(&mut self.settings.brightness, 0.05..=1.0)
+                            .text("Parlaklık")
+                            .fixed_decimals(2),
+                    );
+                    ui.separator();
+                    if ui.button("Kaydet").clicked() {
+                        self.settings.save();
+                        self.saved_text = self.settings.to_text();
+                    }
+                    if dirty {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 200, 90),
+                            "● kaydedilmemiş değişiklik var",
+                        );
+                    } else {
+                        ui.colored_label(Color32::from_gray(130), "✓ kaydedildi (program bu ayarla açılır)");
+                    }
+                }
+            });
+            ui.add_space(6.0);
+        });
+
+        // ----------------------------------------------------------------
+        //  ALT PANEL: durum cubugu
+        // ----------------------------------------------------------------
+        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if st.error.is_empty() {
+                    ui.colored_label(Color32::from_rgb(110, 220, 130), "● LED bağlı");
+                    ui.label(format!("gönderim {:.1} ms", st.send_ms));
+                } else {
+                    ui.colored_label(Color32::from_rgb(255, 100, 100), format!("● {}", st.error));
+                }
+                ui.separator();
+                ui.label(&st.info);
+                ui.separator();
+                ui.label(format!(
+                    "#{:02X}{:02X}{:02X}",
+                    st.color[0], st.color[1], st.color[2]
+                ));
+            });
+            ui.add_space(4.0);
+        });
+
+        // ----------------------------------------------------------------
+        //  SEKMELERİN İÇERİĞİ
+        // ----------------------------------------------------------------
+        match self.tab {
+            Tab::Led => self.draw_led_tab(ctx, t),
+            Tab::Perf => self.draw_perf_tab(ctx),
+        }
 
         *self.shared.lock().unwrap() = self.settings.clone();
         ctx.request_repaint_after(Duration::from_millis(33));
@@ -2210,6 +2571,12 @@ fn main() -> Result<(), eframe::Error> {
     let sens = Arc::new(Sensors::new());
     let quit = Arc::new(AtomicBool::new(false));
 
+    // Performans altyapisi
+    let perf = Arc::new(PerfState::new());
+    let perf_dll_path = Arc::new(Mutex::new(settings.dll_path.clone()));
+    let epoch = sens.epoch;
+    spawn_perf_thread(perf.clone(), perf_dll_path.clone(), epoch);
+
     spawn_sensor_threads(sens.clone());
 
     let eng = {
@@ -2230,6 +2597,10 @@ fn main() -> Result<(), eframe::Error> {
         status,
         t0: Instant::now(),
         saved_text: first_text,
+        tab: Tab::Led,
+        perf,
+        perf_dll_path,
+        epoch,
     };
 
     let res = eframe::run_native(
