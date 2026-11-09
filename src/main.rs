@@ -139,6 +139,70 @@ extern "system" {
     ) -> isize;
 }
 
+#[repr(C)]
+struct PdhFmtValue {
+    status: u32,
+    _pad: u32,
+    value: f64,
+}
+#[link(name = "pdh")]
+extern "system" {
+    fn PdhOpenQueryW(src: *const u16, user: usize, q: *mut isize) -> i32;
+    fn PdhAddEnglishCounterW(q: isize, path: *const u16, user: usize, c: *mut isize) -> i32;
+    fn PdhCollectQueryData(q: isize) -> i32;
+    fn PdhGetFormattedCounterValue(c: isize, fmt: u32, ctype: *mut u32, val: *mut PdhFmtValue) -> i32;
+}
+
+/// Gercek CPU frekansi (Gorev Yoneticisi ile ayni yontem):
+/// "Processor Frequency" x "% Processor Performance" / 100
+struct PdhFreq {
+    q: isize,
+    perf: isize,
+    frq: isize,
+    ok: bool,
+}
+impl PdhFreq {
+    fn new() -> PdhFreq {
+        unsafe {
+            let mut q: isize = 0;
+            if PdhOpenQueryW(null(), 0, &mut q) != 0 {
+                return PdhFreq { q: 0, perf: 0, frq: 0, ok: false };
+            }
+            let (mut c1, mut c2): (isize, isize) = (0, 0);
+            let p1 = wide("\\Processor Information(_Total)\\% Processor Performance");
+            let p2 = wide("\\Processor Information(_Total)\\Processor Frequency");
+            let r1 = PdhAddEnglishCounterW(q, p1.as_ptr(), 0, &mut c1);
+            let r2 = PdhAddEnglishCounterW(q, p2.as_ptr(), 0, &mut c2);
+            let ok = r1 == 0 && r2 == 0;
+            if ok {
+                PdhCollectQueryData(q);
+            }
+            PdhFreq { q, perf: c1, frq: c2, ok }
+        }
+    }
+    fn read(&mut self) -> Option<f64> {
+        if !self.ok {
+            return None;
+        }
+        unsafe {
+            if PdhCollectQueryData(self.q) != 0 {
+                return None;
+            }
+            let mut a = PdhFmtValue { status: 0, _pad: 0, value: 0.0 };
+            let mut b = PdhFmtValue { status: 0, _pad: 0, value: 0.0 };
+            let mut t = 0u32;
+            if PdhGetFormattedCounterValue(self.perf, 0x200, &mut t, &mut a) != 0 {
+                return None;
+            }
+            if PdhGetFormattedCounterValue(self.frq, 0x200, &mut t, &mut b) != 0 {
+                return None;
+            }
+            let mhz = b.value * a.value / 100.0;
+            if mhz > 100.0 && mhz < 8000.0 { Some(mhz) } else { None }
+        }
+    }
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -1303,6 +1367,8 @@ fn start_audio(sens: Arc<Sensors>) {
 type GetDataIntFn = unsafe extern "C" fn(i32, *mut i32) -> i32;
 /// DCHU yazma: SetDCHU_Data
 type SetDataIntFn = unsafe extern "C" fn(i32, *const u8, i32) -> i32;
+/// AppSettings yazma: WriteAppSettings (FnKey ve CC40 ayar senkronizasyonu)
+type WriteAppFn = unsafe extern "C" fn(i32, i32, i32, *const u8) -> i32;
 
 fn load_dchu_get(dll_path: &str) -> Option<GetDataIntFn> {
     unsafe {
@@ -1326,6 +1392,17 @@ fn load_dchu_set(dll_path: &str) -> Option<SetDataIntFn> {
     }
 }
 
+fn load_dchu_app_write(dll_path: &str) -> Option<WriteAppFn> {
+    unsafe {
+        let w = wide(dll_path);
+        let h = LoadLibraryW(w.as_ptr());
+        if h.is_null() { return None; }
+        let p = GetProcAddress(h, b"WriteAppSettings\0".as_ptr());
+        if p.is_null() { return None; }
+        Some(std::mem::transmute::<*mut c_void, WriteAppFn>(p))
+    }
+}
+
 /// DCHU oku: InsydeDCHU.dll başarıda r'ye doğrudan okunan değeri döner (0 değil).
 /// Hata kodu: -2147483646 (0x80000002).
 fn dchu_read(f: GetDataIntFn, cmd: i32) -> Option<i32> {
@@ -1339,6 +1416,7 @@ fn dchu_read(f: GetDataIntFn, cmd: i32) -> Option<i32> {
     }
 }
 
+#[allow(dead_code)]
 fn dchu_send_u32(f: SetDataIntFn, cmd: i32, val: u32) -> bool {
     let bytes = val.to_le_bytes();
     let r = unsafe { f(cmd, bytes.as_ptr(), 4) };
@@ -1410,7 +1488,8 @@ fn apply_gpu_offset(core_mhz: i16, mem_mhz: i16) {
     if let Some(exe) = find_control_gpu_exe() {
         let work_dir = std::path::Path::new(&exe).parent().map(|p| p.to_path_buf());
         let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["set_increment", "0", &format!("{}", core_mhz), &format!("{}", mem_mhz)])
+        // ControlGPU.exe argümanları iki nokta (:) ile ayrıştırır (Program.cs: args[0].Split(':'))
+        cmd.arg(format!("set_increment:0:{}:{}", core_mhz, mem_mhz))
            .creation_flags(0x0800_0000);
         if let Some(w) = work_dir {
             cmd.current_dir(w);
@@ -1424,7 +1503,8 @@ fn apply_gpu_thermal_limit(limit_c: i16) {
     if let Some(exe) = find_control_gpu_exe() {
         let work_dir = std::path::Path::new(&exe).parent().map(|p| p.to_path_buf());
         let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["STL", &format!("{}", limit_c)])
+        // ControlGPU.exe argümanları iki nokta (:) ile ayrıştırır (Program.cs: args[0].Split(':'))
+        cmd.arg(format!("STL:{}", limit_c))
            .creation_flags(0x0800_0000);
         if let Some(w) = work_dir {
             cmd.current_dir(w);
@@ -1458,8 +1538,20 @@ struct PerfState {
     fan_mode:       AtomicU8,  // 0 = Otomatik, 1 = Turbo %100, 2 = Manuel %
     fan_manual_pct: AtomicU32, // %30 .. %100
 
+    // Fan basina kontrol (fan_mode == 2 iken kullanilir)
+    fan1_pct: AtomicU32, // CPU fani %20..100
+    fan2_pct: AtomicU32, // GPU fani %20..100
+    fan_last_rc: AtomicI32,
+
+    // Gercek CPU frekansi (MHz) ve onbellekli bulunma bayraklari
+    cpu_mhz: AtomicU32,
+    tstudio_found: AtomicBool,
+    gpu_found: AtomicBool,
+
     // Emir kuyruğu
     apply_req: AtomicBool,
+    fan_req: AtomicBool,
+    apply_at_ms: AtomicU64,
 }
 
 impl PerfState {
@@ -1485,13 +1577,28 @@ impl PerfState {
             fan_mode:       AtomicU8::new(0),
             fan_manual_pct: AtomicU32::new(70),
 
+            fan1_pct: AtomicU32::new(60),
+            fan2_pct: AtomicU32::new(60),
+            fan_last_rc: AtomicI32::new(i32::MIN),
+
+            cpu_mhz: AtomicU32::new(0),
+            tstudio_found: AtomicBool::new(false),
+            gpu_found: AtomicBool::new(false),
+
             apply_req: AtomicBool::new(false),
+            fan_req: AtomicBool::new(false),
+            apply_at_ms: AtomicU64::new(0),
         }
     }
 }
 
 /// CC40 kurulum yolunu bul
 fn find_cc40_fnkey_path() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(find_cc40_fnkey_path_uncached).clone()
+}
+
+fn find_cc40_fnkey_path_uncached() -> Option<String> {
     let known = "C:\\Program Files\\WindowsApps\\CLEVOCO.FnhotkeysandOSD_7.101.0.0_x64__6h6z29zh29qx0\\FnKey";
     if std::path::Path::new(known).join("ControlGPU.exe").exists() {
         return Some(known.to_string());
@@ -1511,66 +1618,166 @@ fn find_cc40_fnkey_path() -> Option<String> {
     None
 }
 
-/// Arkaplan thread'i: Gerçek EC sensörlerini okur & ayarları uygular
+// ---------------------------------------------------------------------------
+//  Fan yazma (EC): CC40 ve FnKey.exe ile tam senkronize protokol
+//  - SetDCHU_Data(121, 4 bayt: [data0, data1, data2, sub])
+//  - WriteAppSettings(4, offset, len, &val): FnKey'in ayarı ezmesini engeller,
+//    FnKey ile çatışmadan ve FnKey'i kapatmadan (hotkey'ler korunarak) çalışır!
+// ---------------------------------------------------------------------------
+
+fn setwmi4(sd: SetDataIntFn, cmd: i32, sub: u8, data: u32) -> i32 {
+    let mut b = [0u8; 4];
+    let d = data.to_le_bytes();
+    b[0] = d[0];
+    b[1] = d[1];
+    b[2] = d[2];
+    b[3] = sub;
+    unsafe { sd(cmd, b.as_ptr(), 4) }
+}
+
+fn fan_apply(sf: SetDataIntFn, wf: Option<WriteAppFn>, perf: &PerfState) -> i32 {
+    let mode = perf.fan_mode.load(Ordering::Relaxed);
+    let v0 = 0u8;
+    let v1 = 1u8;
+    match mode {
+        0 => {
+            // Otomatik mod: FnKey ve CC40 uyumlu
+            if let Some(wa) = wf {
+                unsafe {
+                    wa(4, 9, 1, &v0); // 1033 = 0 (Turbo fan kapalı)
+                    wa(4, 5, 1, &v0); // 1029 = 0 (Otomatik mod)
+                }
+            }
+            let r1 = setwmi4(sf, 121, 1, 0);
+            let r2 = setwmi4(sf, 121, 34, 1);
+            if r2 >= 0 { r2 } else { r1 }
+        }
+        1 => {
+            // Turbo %100 fan (Maksimum Hız): FnKey korumalı (FnKey geri ezmez!)
+            if let Some(wa) = wf {
+                unsafe {
+                    wa(4, 9, 1, &v1); // 1033 = 1 (Turbo fan açık)
+                    wa(4, 5, 1, &v0); // 1029 = 0
+                }
+            }
+            setwmi4(sf, 121, 1, 8) // Mode 8 = Turbo Fan
+        }
+        _ => {
+            // Manuel % slider modu (20..100):
+            let pct = perf.fan_manual_pct.load(Ordering::Relaxed).clamp(20, 100);
+            let duty = ((pct as f64 / 100.0) * 255.0).round() as u32;
+            let pct_byte = pct as u8;
+            let mode6 = 6u8; // custom mode
+            if let Some(wa) = wf {
+                unsafe {
+                    wa(4, 5, 1, &mode6);    // 1029 = 6 (Custom)
+                    wa(4, 7, 1, &pct_byte); // 1031 = %
+                    wa(4, 9, 1, &v0);       // 1033 = 0
+                }
+            }
+            setwmi4(sf, 121, 14, duty) // sub 14 = Set Fan Duty
+        }
+    }
+}
+
+/// Agir isler (powercfg, ControlGPU, cc30wk) AYRI thread'de: sensor/fan dongusunu bloklamaz,
+/// slider surukleme bitene kadar (400 ms) beklenir ve sadece DEGISEN ayar uygulanir.
+fn spawn_apply_thread(perf: Arc<PerfState>, epoch: Instant) {
+    std::thread::spawn(move || {
+        let mut last_preset: Option<u8> = None;
+        let mut last_cpu: Option<u32> = None;
+        let mut last_gpu: Option<(i16, i16)> = None;
+        let mut last_tlim: Option<i16> = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if !perf.apply_req.load(Ordering::Relaxed) {
+                continue;
+            }
+            let now = epoch.elapsed().as_millis() as u64;
+            if now < perf.apply_at_ms.load(Ordering::Relaxed) {
+                continue;
+            }
+            perf.apply_req.store(false, Ordering::Relaxed);
+
+            let preset = perf.active_preset.load(Ordering::Relaxed);
+            if last_preset != Some(preset) {
+                if preset == 0 {
+                    trigger_cc30wk_mode(0);
+                } else if preset == 2 || preset == 3 {
+                    trigger_cc30wk_mode(1);
+                }
+                last_preset = Some(preset);
+            }
+
+            let turbo = perf.turbo_enabled.load(Ordering::Relaxed);
+            let pct = if turbo { perf.cpu_max_pct.load(Ordering::Relaxed) } else { 99 };
+            if last_cpu != Some(pct) {
+                apply_cpu_throttle(pct);
+                last_cpu = Some(pct);
+            }
+
+            let core = perf.gpu_core_oc.load(Ordering::Relaxed) as i16;
+            let mem = perf.gpu_mem_oc.load(Ordering::Relaxed) as i16;
+            if last_gpu != Some((core, mem)) {
+                apply_gpu_offset(core, mem);
+                last_gpu = Some((core, mem));
+            }
+            let t_lim = perf.gpu_temp_limit.load(Ordering::Relaxed) as i16;
+            if last_tlim != Some(t_lim) {
+                apply_gpu_thermal_limit(t_lim);
+                last_tlim = Some(t_lim);
+            }
+        }
+    });
+}
+
+/// Arkaplan thread'i: gercek EC sensorleri + fan yazma + CPU frekansi (500 ms'de bir)
 fn spawn_perf_thread(perf: Arc<PerfState>, dll_path: Arc<Mutex<String>>, epoch: Instant) {
     std::thread::spawn(move || {
         let mut last_dll = String::new();
         let mut get_fn: Option<GetDataIntFn> = None;
         let mut set_fn: Option<SetDataIntFn> = None;
+        let mut app_write_fn: Option<WriteAppFn> = None;
+        let mut pdh = PdhFreq::new();
+        let mut next_probe = 0u64;
 
         loop {
-            // Değişiklik isteği geldiyse uygula
-            if perf.apply_req.swap(false, Ordering::Relaxed) {
-                let preset = perf.active_preset.load(Ordering::Relaxed);
-                if preset == 0 {
-                    trigger_cc30wk_mode(0); // Performans
-                } else if preset == 2 || preset == 3 {
-                    trigger_cc30wk_mode(1); // Sessiz / Güç Tasarrufu
-                }
+            let now = epoch.elapsed().as_millis() as u64;
 
-                let turbo = perf.turbo_enabled.load(Ordering::Relaxed);
-                let pct = if turbo {
-                    perf.cpu_max_pct.load(Ordering::Relaxed)
-                } else {
-                    99 // 99% = Intel Turbo Boost donanımsal olarak kapalı (Base clock sınırı)
-                };
-                apply_cpu_throttle(pct);
-
-                let core = perf.gpu_core_oc.load(Ordering::Relaxed) as i16;
-                let mem = perf.gpu_mem_oc.load(Ordering::Relaxed) as i16;
-                apply_gpu_offset(core, mem);
-
-                let t_lim = perf.gpu_temp_limit.load(Ordering::Relaxed) as i16;
-                apply_gpu_thermal_limit(t_lim);
-
-                if let Some(sf) = set_fn {
-                    let fmode = perf.fan_mode.load(Ordering::Relaxed);
-                    if fmode == 0 {
-                        // Otomatik mod
-                        dchu_send_u32(sf, 105, 1);
-                    } else if fmode == 1 {
-                        // Maksimum Turbo %100
-                        dchu_send_u32(sf, 104, 100);
-                        dchu_send_u32(sf, 104, 255);
-                    } else if fmode == 2 {
-                        // Manuel % slider
-                        let man = perf.fan_manual_pct.load(Ordering::Relaxed);
-                        dchu_send_u32(sf, 104, man);
-                    }
-                }
+            // Dosya var mi kontrolu: 10 snde bir (eskiden her karede yapiliyordu)
+            if now >= next_probe {
+                perf.tstudio_found.store(find_tstudio_dir().is_some(), Ordering::Relaxed);
+                perf.gpu_found.store(find_control_gpu_exe().is_some(), Ordering::Relaxed);
+                next_probe = now + 10_000;
             }
 
-            // DLL güncelleme
+            // DLL guncelleme
             let dll = dll_path.lock().unwrap().clone();
             if dll != last_dll {
                 last_dll = dll.clone();
                 get_fn = load_dchu_get(&dll);
                 set_fn = load_dchu_set(&dll);
+                app_write_fn = load_dchu_app_write(&dll);
             }
 
-            // SENSÖR OKUMA: Doğrulanmış DCHU Kanalları
+            // Guvenlik: manuel/ozel fan modunda asiri sicaklikta otomatige don
+            let ct = perf.cpu_temp.load(Ordering::Relaxed);
+            let gt = perf.gpu_temp_hw.load(Ordering::Relaxed);
+            if perf.fan_mode.load(Ordering::Relaxed) == 2 && (ct >= 88 || gt >= 85) {
+                perf.fan_mode.store(0, Ordering::Relaxed);
+                perf.fan_req.store(true, Ordering::Relaxed);
+            }
+
+            // Fan yazma istegi
+            if perf.fan_req.swap(false, Ordering::Relaxed) {
+                if let Some(sf) = set_fn {
+                    let rc = fan_apply(sf, app_write_fn, &perf);
+                    perf.fan_last_rc.store(rc, Ordering::Relaxed);
+                }
+            }
+
+            // SENSOR OKUMA
             if let Some(f) = get_fn {
-                // Fan1Info (cmd 99) -> byte 2: CPU Sıcaklığı (°C), byte 1: CPU Fan Yükü (%)
                 if let Some(v99) = dchu_read(f, 99) {
                     let cpu_t = ((v99 >> 16) & 0xFF) as i32;
                     let cpu_d = ((v99 >> 8) & 0xFF) as i32;
@@ -1581,8 +1788,6 @@ fn spawn_perf_thread(perf: Arc<PerfState>, dll_path: Arc<Mutex<String>>, epoch: 
                         perf.cpu_fan_duty.store(cpu_d, Ordering::Relaxed);
                     }
                 }
-
-                // Fan2Info (cmd 100) -> byte 2: GPU Sıcaklığı (°C), byte 1: GPU Fan Yükü (%)
                 if let Some(v100) = dchu_read(f, 100) {
                     let gpu_t = ((v100 >> 16) & 0xFF) as i32;
                     let gpu_d = ((v100 >> 8) & 0xFF) as i32;
@@ -1593,8 +1798,6 @@ fn spawn_perf_thread(perf: Arc<PerfState>, dll_path: Arc<Mutex<String>>, epoch: 
                         perf.gpu_fan_duty.store(gpu_d, Ordering::Relaxed);
                     }
                 }
-
-                // GetFan12RPM (cmd 112)
                 if let Some(v112) = dchu_read(f, 112) {
                     let f1 = (v112 & 0xFFFF) as i32;
                     let f2 = ((v112 >> 16) & 0xFFFF) as i32;
@@ -1605,19 +1808,21 @@ fn spawn_perf_thread(perf: Arc<PerfState>, dll_path: Arc<Mutex<String>>, epoch: 
                         perf.fan_gpu_rpm.store(f2, Ordering::Relaxed);
                     }
                 }
-
-                // Şarj durumu (cmd 119)
                 if let Some(cs) = dchu_read(f, 119) {
                     perf.charge_raw.store(cs, Ordering::Relaxed);
                 }
-
                 perf.sensor_ok.store(true, Ordering::Relaxed);
                 perf.last_read_ms.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
             } else {
                 perf.sensor_ok.store(false, Ordering::Relaxed);
             }
 
-            std::thread::sleep(Duration::from_millis(1000));
+            // Gercek CPU frekansi
+            if let Some(mhz) = pdh.read() {
+                perf.cpu_mhz.store(mhz.round() as u32, Ordering::Relaxed);
+            }
+
+            std::thread::sleep(Duration::from_millis(500));
         }
     });
 }
@@ -2139,7 +2344,7 @@ fn draw_keyboard(ui: &mut egui::Ui, rgb: [u8; 3]) {
                 egui::vec2(kw, kh),
             );
             p.rect_filled(r, 4.0, fill);
-            p.rect_stroke(r, 4.0, Stroke::new(1.3, line));
+            p.rect_stroke(r, 4.0, Stroke::new(1.3_f32, line));
         }
     }
     let sw = kw * 6.0 + gap * 5.0;
@@ -2149,7 +2354,7 @@ fn draw_keyboard(ui: &mut egui::Ui, rgb: [u8; 3]) {
         egui::vec2(sw, kh),
     );
     p.rect_filled(r, 4.0, fill);
-    p.rect_stroke(r, 4.0, Stroke::new(1.3, line));
+    p.rect_stroke(r, 4.0, Stroke::new(1.3_f32, line));
 }
 
 fn draw_card(ui: &mut egui::Ui, m: Mode, selected: bool, base: &Settings, t: f64) -> bool {
@@ -2199,7 +2404,7 @@ fn draw_card(ui: &mut egui::Ui, m: Mode, selected: bool, base: &Settings, t: f64
         Color32::from_gray(150),
     );
     if selected {
-        p.rect_stroke(rect, 12.0, Stroke::new(2.5, m.accent()));
+        p.rect_stroke(rect, 12.0, Stroke::new(2.5_f32, m.accent()));
     }
     resp.clicked()
 }
@@ -2227,9 +2432,9 @@ fn hue_slider(ui: &mut egui::Ui, hue: &mut f64) {
     let mx = rect.left() + rect.width() * (*hue as f32);
     p.line_segment(
         [Pos2::new(mx, rect.top() - 2.0), Pos2::new(mx, rect.bottom() + 2.0)],
-        Stroke::new(3.0, Color32::WHITE),
+        Stroke::new(3.0_f32, Color32::WHITE),
     );
-    p.rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(90)));
+    p.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, Color32::from_gray(90)));
 }
 
 /// Tus katmani ayarlari (Tus dalgasi modu ve Combine ortak kullanir).
@@ -2415,11 +2620,15 @@ impl App {
         let mut mem_oc     = self.perf.gpu_mem_oc.load(Ordering::Relaxed);
         let mut t_limit    = self.perf.gpu_temp_limit.load(Ordering::Relaxed);
         let mut fan_m      = self.perf.fan_mode.load(Ordering::Relaxed);
-        let mut fan_man    = self.perf.fan_manual_pct.load(Ordering::Relaxed);
+        let mut fan_pct    = self.perf.fan_manual_pct.load(Ordering::Relaxed);
         let mut changed    = false;
 
-        let tstudio_found  = find_tstudio_dir().is_some();
-        let gpu_found      = find_control_gpu_exe().is_some();
+        let tstudio_found  = self.perf.tstudio_found.load(Ordering::Relaxed);
+        let gpu_found      = self.perf.gpu_found.load(Ordering::Relaxed);
+        let cpu_mhz        = self.perf.cpu_mhz.load(Ordering::Relaxed);
+        let fan_rc         = self.perf.fan_last_rc.load(Ordering::Relaxed);
+        let mut fan1       = self.perf.fan1_pct.load(Ordering::Relaxed);
+        let mut fan2       = self.perf.fan2_pct.load(Ordering::Relaxed);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2522,17 +2731,24 @@ impl App {
 
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("CPU Frekansı:").strong());
+                        if cpu_mhz > 0 {
+                            ui.colored_label(Color32::from_rgb(255, 190, 70), format!("{} MHz", cpu_mhz));
+                        } else {
+                            ui.label("— MHz");
+                        }
+                        ui.separator();
                         ui.label(egui::RichText::new("Anlık Devir:").strong());
                         if fan_cpu > 0 {
-                            ui.colored_label(Color32::from_rgb(100, 220, 255), format!("CPU: {} RPM", fan_cpu));
+                            ui.colored_label(Color32::from_rgb(100, 220, 255), format!("CPU fan: {} RPM", fan_cpu));
                         } else {
-                            ui.label("CPU: — RPM");
+                            ui.label("CPU fan: — RPM");
                         }
                         ui.separator();
                         if fan_gpu > 0 {
-                            ui.colored_label(Color32::from_rgb(130, 255, 160), format!("GPU: {} RPM", fan_gpu));
+                            ui.colored_label(Color32::from_rgb(130, 255, 160), format!("GPU fan: {} RPM", fan_gpu));
                         } else {
-                            ui.label("GPU: — RPM");
+                            ui.label("GPU fan: — RPM");
                         }
                         ui.separator();
                         ui.label(format!("Yük: CPU %{} / GPU %{}", cpu_duty.max(0), gpu_duty.max(0)));
@@ -2541,13 +2757,13 @@ impl App {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.label("Çalışma Rejimi:");
-                        if ui.selectable_value(&mut fan_m, 0, "🌀 Otomatik (Auto)").clicked() {
+                        if ui.selectable_value(&mut fan_m, 0, "🌀 Otomatik").clicked() {
                             changed = true;
                         }
-                        if ui.selectable_value(&mut fan_m, 1, "🚀 Maksimum Turbo (%100)").clicked() {
+                        if ui.selectable_value(&mut fan_m, 1, "🚀 En fazla (iki fan %100)").clicked() {
                             changed = true;
                         }
-                        if ui.selectable_value(&mut fan_m, 2, "🎚️ Manuel % Slider").clicked() {
+                        if ui.selectable_value(&mut fan_m, 2, "🎚️ Özel (fan başına)").clicked() {
                             changed = true;
                         }
                     });
@@ -2555,11 +2771,22 @@ impl App {
                     if fan_m == 2 {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            ui.label("Manuel Fan Hızı Limiti:");
-                            if ui.add(egui::Slider::new(&mut fan_man, 30..=100).text("%").fixed_decimals(0)).changed() {
+                            ui.label("Fan Hız Limiti:");
+                            if ui.add(egui::Slider::new(&mut fan_pct, 20..=100).text("%").fixed_decimals(0)).changed() {
+                                fan1 = fan_pct;
+                                fan2 = fan_pct;
                                 changed = true;
                             }
                         });
+                        let rc_txt = if fan_rc == i32::MIN {
+                            "bekleniyor".to_string()
+                        } else if fan_rc >= 0 {
+                            format!("EC/FnKey senkronize (kod {})", fan_rc)
+                        } else {
+                            format!("EC Hata kodu {}", fan_rc)
+                        };
+                        ui.label(egui::RichText::new(rc_txt).small().color(Color32::from_gray(130)));
+                        ui.label(egui::RichText::new("Güvenlik: CPU ≥88°C veya GPU ≥85°C olursa otomatik moda döner.").small().color(Color32::from_gray(110)));
                     }
                 });
 
@@ -2645,8 +2872,13 @@ impl App {
                     self.perf.gpu_mem_oc.store(mem_oc, Ordering::Relaxed);
                     self.perf.gpu_temp_limit.store(t_limit, Ordering::Relaxed);
                     self.perf.fan_mode.store(fan_m, Ordering::Relaxed);
-                    self.perf.fan_manual_pct.store(fan_man, Ordering::Relaxed);
+                    self.perf.fan_manual_pct.store(fan_pct, Ordering::Relaxed);
+                    self.perf.fan1_pct.store(fan1, Ordering::Relaxed);
+                    self.perf.fan2_pct.store(fan2, Ordering::Relaxed);
+                    let now_ms = self.epoch.elapsed().as_millis() as u64;
+                    self.perf.apply_at_ms.store(now_ms + 400, Ordering::Relaxed); // slider birakilana kadar bekle
                     self.perf.apply_req.store(true, Ordering::Relaxed);
+                    self.perf.fan_req.store(true, Ordering::Relaxed);
                 }
 
                 ui.add_space(14.0);
@@ -2659,6 +2891,16 @@ impl App {
                 ui.add_space(6.0);
 
                 egui::Grid::new("hw_sensors_grid").num_columns(3).spacing([24.0, 8.0]).show(ui, |ui| {
+                    // CPU Frekansı (PDH)
+                    ui.label(egui::RichText::new("CPU Frekansı").color(Color32::from_gray(210)));
+                    if cpu_mhz > 0 {
+                        ui.label(format!("{} MHz", cpu_mhz));
+                    } else {
+                        ui.colored_label(Color32::from_gray(100), "Okunuyor...");
+                    }
+                    ui.label(egui::RichText::new("Windows PDH").small().color(Color32::from_gray(120)));
+                    ui.end_row();
+
                     // CPU Sıcaklığı
                     ui.label(egui::RichText::new("CPU Sıcaklığı").color(Color32::from_gray(210)));
                     if cpu_temp > 0 {
@@ -2751,7 +2993,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let t = self.t0.elapsed().as_secs_f64();
         let st = self.status.lock().unwrap().clone();
-        let dirty = self.settings.to_text() != self.saved_text;
+        let dirty = self.tab == Tab::Led && self.settings.to_text() != self.saved_text;
 
         // ----------------------------------------------------------------
         //  UST PANEL: baslik + klavye + sekme secimi
@@ -2855,7 +3097,7 @@ impl eframe::App for App {
         }
 
         *self.shared.lock().unwrap() = self.settings.clone();
-        ctx.request_repaint_after(Duration::from_millis(33));
+        ctx.request_repaint_after(Duration::from_millis(if self.tab == Tab::Led { 33 } else { 80 }));
     }
 }
 
@@ -2892,6 +3134,7 @@ fn main() -> Result<(), eframe::Error> {
     let perf_dll_path = Arc::new(Mutex::new(settings.dll_path.clone()));
     let epoch = sens.epoch;
     spawn_perf_thread(perf.clone(), perf_dll_path.clone(), epoch);
+    spawn_apply_thread(perf.clone(), epoch);
 
     spawn_sensor_threads(sens.clone());
 
