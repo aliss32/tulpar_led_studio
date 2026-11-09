@@ -293,8 +293,8 @@ impl Mode {
     /// Combine modunda arka plan katmani olarak secilebilen modlar.
     const BASES: [Mode; 14] = [
         Mode::Screen,
-        Mode::Static,
         Mode::Rainbow,
+        Mode::Static,
         Mode::Breathe,
         Mode::Music,
         Mode::System,
@@ -443,6 +443,11 @@ struct Settings {
     cmb_caps: bool,
     caps_hue: f64,
     caps_strength: f64,
+    cmb_bg: bool,
+    // ekran seridi: renge gore parlaklik
+    screen_adapt: bool,
+    screen_min: f64,
+    screen_gamma: f64,
 }
 
 fn default_dll() -> String {
@@ -489,6 +494,10 @@ impl Default for Settings {
             cmb_caps: true,
             caps_hue: 0.0,
             caps_strength: 60.0,
+            cmb_bg: true,
+            screen_adapt: true,
+            screen_min: 5.0,
+            screen_gamma: 1.6,
         }
     }
 }
@@ -549,6 +558,10 @@ impl Settings {
         t.push_str(&format!("cmb_caps={}\n", if self.cmb_caps { 1 } else { 0 }));
         t.push_str(&format!("caps_hue={}\n", self.caps_hue));
         t.push_str(&format!("caps_strength={}\n", self.caps_strength));
+        t.push_str(&format!("cmb_bg={}\n", if self.cmb_bg { 1 } else { 0 }));
+        t.push_str(&format!("screen_adapt={}\n", if self.screen_adapt { 1 } else { 0 }));
+        t.push_str(&format!("screen_min={}\n", self.screen_min));
+        t.push_str(&format!("screen_gamma={}\n", self.screen_gamma));
         t
     }
 
@@ -635,6 +648,18 @@ impl Settings {
                 "ping_host" => {
                     if !v.is_empty() {
                         st.ping_host = v.to_string();
+                    }
+                }
+                "cmb_bg" => st.cmb_bg = v == "1",
+                "screen_adapt" => st.screen_adapt = v == "1",
+                "screen_min" => {
+                    if let Some(x) = num {
+                        st.screen_min = x.max(0.0).min(40.0);
+                    }
+                }
+                "screen_gamma" => {
+                    if let Some(x) = num {
+                        st.screen_gamma = x.max(1.0).min(3.0);
                     }
                 }
                 "key_idle" => {
@@ -757,10 +782,13 @@ fn render(s: &Settings, i: &Inputs, t: f64) -> [f64; 3] {
         return render_mode(s, s.mode, i, t);
     }
     // Combine: arka plan + tus katmani + caps katmani ust uste
-    let base = render_mode(s, s.cmb_base, i, t);
+    let bg_on = s.cmb_bg;
+    let base = if bg_on { render_mode(s, s.cmb_base, i, t) } else { [0.0, 0.0, 0.0] };
     let mut out = base;
     if s.cmb_keys {
-        out = lerp3(base, key_color(s, i), clamp01(i.act));
+        // Arka plan yoksa tus katmani surekli aktif (bosta dusuk, basinca patlar)
+        let a = if bg_on { clamp01(i.act) } else { 1.0 };
+        out = lerp3(base, key_color(s, i), a);
     }
     if s.cmb_caps && i.caps {
         // Parlakligi koru, sadece rengi caps rengine cevir (tus patlamasi kaybolmasin)
@@ -976,6 +1004,9 @@ struct Sensors {
     screen_on: AtomicBool,
     screen_strip: AtomicU32,
     screen_vivid: AtomicU32,
+    screen_adapt: AtomicBool,
+    screen_min: AtomicU32,
+    screen_gamma: AtomicU32,
 }
 
 impl Sensors {
@@ -994,6 +1025,9 @@ impl Sensors {
             screen_on: AtomicBool::new(false),
             screen_strip: AtomicU32::new(f2u(12.0)),
             screen_vivid: AtomicU32::new(f2u(1.4)),
+            screen_adapt: AtomicBool::new(true),
+            screen_min: AtomicU32::new(f2u(5.0)),
+            screen_gamma: AtomicU32::new(f2u(1.6)),
         }
     }
 }
@@ -1080,7 +1114,10 @@ fn spawn_sensor_threads(sens: Arc<Sensors>) {
         }
         let strip = u2f(s3.screen_strip.load(Ordering::Relaxed));
         let vivid = u2f(s3.screen_vivid.load(Ordering::Relaxed));
-        if let Some(c) = capture_strip(strip, vivid) {
+        let adapt = s3.screen_adapt.load(Ordering::Relaxed);
+        let vmin = u2f(s3.screen_min.load(Ordering::Relaxed)) / 100.0;
+        let gamma = u2f(s3.screen_gamma.load(Ordering::Relaxed));
+        if let Some(c) = capture_strip(strip, vivid, adapt, vmin, gamma) {
             let r = c[0].max(0.0).min(255.0) as u32;
             let g = c[1].max(0.0).min(255.0) as u32;
             let b = c[2].max(0.0).min(255.0) as u32;
@@ -1091,7 +1128,7 @@ fn spawn_sensor_threads(sens: Arc<Sensors>) {
 }
 
 /// Ekranin alt %strip_pct kismini kucultup renk ortalamasi alir.
-fn capture_strip(strip_pct: f64, vivid: f64) -> Option<[f64; 3]> {
+fn capture_strip(strip_pct: f64, vivid: f64, adapt: bool, vmin: f64, gamma: f64) -> Option<[f64; 3]> {
     const W: i32 = 64;
     const H: i32 = 8;
     unsafe {
@@ -1155,6 +1192,8 @@ fn capture_strip(strip_pct: f64, vivid: f64) -> Option<[f64; 3]> {
             return None;
         }
         let (mut sr, mut sg, mut sb, mut sw_) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let mut lvl = 0.0f64;
+        let mut npx = 0.0f64;
         for px in buf.chunks(4) {
             let b = px[0] as f64;
             let g = px[1] as f64;
@@ -1167,13 +1206,23 @@ fn capture_strip(strip_pct: f64, vivid: f64) -> Option<[f64; 3]> {
             sg += g * w;
             sb += b * w;
             sw_ += w;
+            lvl += (mx / 255.0).powf(gamma);
+            npx += 1.0;
         }
         if sw_ <= 0.0 {
             return Some([0.0, 0.0, 0.0]);
         }
         let avg = [sr / sw_, sg / sw_, sb / sw_];
         let (h, s, v) = rgb_to_hsv(avg);
-        Some(hsv(h, (s * vivid).min(1.0), (v * 1.25).min(1.0)))
+        if adapt {
+            // Parlaklik: seridin ortalama aydinligina gore. Siyah -> vmin, koyu bordo -> dusuk,
+            // acik/cirtlak renk -> tam parlaklik. Ton ve doygunluk renkli piksellerden gelir.
+            let level = clamp01(lvl / npx.max(1.0) * 1.6);
+            let vmin = clamp01(vmin);
+            Some(hsv(h, (s * vivid).min(1.0), vmin + (1.0 - vmin) * level))
+        } else {
+            Some(hsv(h, (s * vivid).min(1.0), (v * 1.25).min(1.0)))
+        }
     }
 }
 
@@ -1363,7 +1412,7 @@ fn info_text(s: &Settings, i: &Inputs) -> String {
         Mode::TypingHeat => format!("Yazma hızı %{:.0}", i.typing * 100.0),
         Mode::Combine => format!(
             "Arka plan: {}{}",
-            s.cmb_base.name(),
+            if s.cmb_bg { s.cmb_base.name() } else { "yok" },
             if s.cmb_keys && i.act > 0.5 { " • yazıyor" } else { "" }
         ),
         Mode::IdleActive => format!("Boşta {:.0} sn", i.idle_secs),
@@ -1446,13 +1495,20 @@ fn engine(
 
         // sensor bayraklari
         // Combine modunda sensorler arka plan katmanina gore acilir
-        let eff = if s.mode == Mode::Combine { s.cmb_base } else { s.mode };
+        let eff = if s.mode == Mode::Combine {
+            if s.cmb_bg { s.cmb_base } else { Mode::Combine }
+        } else {
+            s.mode
+        };
         sens.gpu_needed
             .store(eff == Mode::System && s.sys_src == SysSrc::Gpu, Ordering::Relaxed);
         sens.ping_needed.store(eff == Mode::Ping, Ordering::Relaxed);
         sens.screen_on.store(eff == Mode::Screen, Ordering::Relaxed);
         sens.screen_strip.store(f2u(s.screen_strip), Ordering::Relaxed);
         sens.screen_vivid.store(f2u(s.screen_vivid), Ordering::Relaxed);
+        sens.screen_adapt.store(s.screen_adapt, Ordering::Relaxed);
+        sens.screen_min.store(f2u(s.screen_min), Ordering::Relaxed);
+        sens.screen_gamma.store(f2u(s.screen_gamma), Ordering::Relaxed);
         if s.ping_host != last_host {
             last_host = s.ping_host.clone();
             *sens.ping_host.lock().unwrap() = last_host.clone();
@@ -1874,14 +1930,13 @@ struct App {
     status: Arc<Mutex<Status>>,
     t0: Instant,
     saved_text: String,
-    pending_text: String,
-    pending_since: Instant,
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let t = self.t0.elapsed().as_secs_f64();
         let st = self.status.lock().unwrap().clone();
+        let dirty = self.settings.to_text() != self.saved_text;
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(6.0);
@@ -1906,6 +1961,19 @@ impl eframe::App for App {
                         .text("Parlaklık")
                         .fixed_decimals(2),
                 );
+                ui.separator();
+                if ui.button("Kaydet").clicked() {
+                    self.settings.save();
+                    self.saved_text = self.settings.to_text();
+                }
+                if dirty {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 200, 90),
+                        "● kaydedilmemiş değişiklik var",
+                    );
+                } else {
+                    ui.colored_label(Color32::from_gray(130), "✓ kaydedildi (program bu ayarla açılır)");
+                }
             });
             ui.add_space(6.0);
         });
@@ -1933,19 +2001,31 @@ impl eframe::App for App {
         egui::SidePanel::right("opts").min_width(300.0).show(ctx, |ui| {
             ui.add_space(8.0);
             let m = self.settings.mode;
-            let eff = if m == Mode::Combine { self.settings.cmb_base } else { m };
+            let eff = if m == Mode::Combine {
+                if self.settings.cmb_bg { self.settings.cmb_base } else { Mode::Combine }
+            } else {
+                m
+            };
             ui.heading(egui::RichText::new(m.name()).color(m.accent()));
             ui.label(egui::RichText::new(m.desc()).color(Color32::from_gray(150)));
             ui.separator();
 
             if m == Mode::Combine {
-                egui::ComboBox::from_label("Arka plan (tuşa basılmazken)")
-                    .selected_text(self.settings.cmb_base.name())
-                    .show_ui(ui, |ui| {
-                        for b in Mode::BASES.iter() {
-                            ui.selectable_value(&mut self.settings.cmb_base, *b, b.name());
-                        }
-                    });
+                ui.label(
+                    egui::RichText::new("Birlikte çalışacak katmanları tikle:")
+                        .color(Color32::from_gray(170)),
+                );
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.settings.cmb_bg, "Arka plan katmanı (tuşa basılmazken)");
+                if self.settings.cmb_bg {
+                    egui::ComboBox::from_label("Arka plan modu")
+                        .selected_text(self.settings.cmb_base.name())
+                        .show_ui(ui, |ui| {
+                            for b in Mode::BASES.iter() {
+                                ui.selectable_value(&mut self.settings.cmb_base, *b, b.name());
+                            }
+                        });
+                }
                 ui.add_space(6.0);
                 ui.checkbox(&mut self.settings.cmb_keys, "Tuş katmanı (yazarken devreye girer)");
                 if self.settings.cmb_keys {
@@ -1962,12 +2042,14 @@ impl eframe::App for App {
                             .fixed_decimals(0),
                     );
                 }
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(format!("Arka plan ayarları: {}", eff.name())).strong(),
-                );
-                ui.add_space(4.0);
+                if self.settings.cmb_bg {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("Arka plan ayarları: {}", eff.name())).strong(),
+                    );
+                    ui.add_space(4.0);
+                }
             } else if m == Mode::KeyFlash {
                 key_panel(ui, &mut self.settings, false);
                 ui.add_space(6.0);
@@ -2027,6 +2109,29 @@ impl eframe::App for App {
                             .text("Canlılık"),
                     );
                     ui.label("Birincil monitörün alt şeridi okunur.");
+                    ui.checkbox(
+                        &mut self.settings.screen_adapt,
+                        "Ekran parlaklığına göre ışığı ayarla",
+                    );
+                    if self.settings.screen_adapt {
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.screen_min, 0.0..=40.0)
+                                .text("En düşük parlaklık % (siyahta)")
+                                .fixed_decimals(0),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.screen_gamma, 1.0..=3.0)
+                                .text("Koyu renk bastırma")
+                                .fixed_decimals(1),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Siyah ve koyu bordo gibi renklerde ışık kısılır, açık ve cırtlak renklerde parlar.",
+                            )
+                            .small()
+                            .color(Color32::from_gray(130)),
+                        );
+                    }
                 }
                 Mode::Pomodoro => {
                     ui.add(egui::Slider::new(&mut self.settings.pomo_work, 1.0..=90.0).text("Çalışma dk"));
@@ -2072,18 +2177,6 @@ impl eframe::App for App {
             });
         });
 
-        // Ayar degisince 0.8 sn sonra otomatik kaydet
-        let cur = self.settings.to_text();
-        if cur != self.pending_text {
-            self.pending_text = cur;
-            self.pending_since = Instant::now();
-        } else if self.pending_text != self.saved_text
-            && self.pending_since.elapsed() > Duration::from_millis(800)
-        {
-            write_settings_text(&self.pending_text);
-            self.saved_text = self.pending_text.clone();
-        }
-
         *self.shared.lock().unwrap() = self.settings.clone();
         ctx.request_repaint_after(Duration::from_millis(33));
     }
@@ -2113,7 +2206,6 @@ fn main() -> Result<(), eframe::Error> {
     let settings = Settings::load();
     let first_text = settings.to_text();
     let shared = Arc::new(Mutex::new(settings.clone()));
-    let shared_exit = shared.clone();
     let status = Arc::new(Mutex::new(Status::default()));
     let sens = Arc::new(Sensors::new());
     let quit = Arc::new(AtomicBool::new(false));
@@ -2137,9 +2229,7 @@ fn main() -> Result<(), eframe::Error> {
         shared,
         status,
         t0: Instant::now(),
-        saved_text: first_text.clone(),
-        pending_text: first_text,
-        pending_since: Instant::now(),
+        saved_text: first_text,
     };
 
     let res = eframe::run_native(
@@ -2153,6 +2243,5 @@ fn main() -> Result<(), eframe::Error> {
 
     quit.store(true, Ordering::Relaxed);
     let _ = eng.join();
-    shared_exit.lock().unwrap().save();
     res
 }
