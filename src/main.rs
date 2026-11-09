@@ -256,6 +256,7 @@ enum Mode {
     DayTone,
     Pomodoro,
     Caps,
+    Combine,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -266,7 +267,8 @@ enum SysSrc {
 }
 
 impl Mode {
-    const ALL: [Mode; 19] = [
+    const ALL: [Mode; 20] = [
+        Mode::Combine,
         Mode::Rainbow,
         Mode::Breathe,
         Mode::Static,
@@ -286,6 +288,24 @@ impl Mode {
         Mode::DayTone,
         Mode::Pomodoro,
         Mode::Caps,
+    ];
+
+    /// Combine modunda arka plan katmani olarak secilebilen modlar.
+    const BASES: [Mode; 14] = [
+        Mode::Screen,
+        Mode::Static,
+        Mode::Rainbow,
+        Mode::Breathe,
+        Mode::Music,
+        Mode::System,
+        Mode::Battery,
+        Mode::Ping,
+        Mode::Fire,
+        Mode::Storm,
+        Mode::Heart,
+        Mode::Aurora,
+        Mode::DayTone,
+        Mode::Pomodoro,
     ];
 
     fn name(self) -> &'static str {
@@ -309,6 +329,7 @@ impl Mode {
             Mode::DayTone => "Gün saati tonu",
             Mode::Pomodoro => "Pomodoro",
             Mode::Caps => "Caps Lock göstergesi",
+            Mode::Combine => "Combine (karışık)",
         }
     }
 
@@ -317,7 +338,7 @@ impl Mode {
             Mode::Static => "Tek renk, istediğin ton",
             Mode::Rainbow => "Yumuşak sürekli renk geçişi",
             Mode::Breathe => "Yavaşça parlayıp sönen ışık",
-            Mode::KeyFlash => "Tuşa basınca ışık parlar",
+            Mode::KeyFlash => "Boşta loş, tuşa basınca patlar",
             Mode::TypingHeat => "Hızlı yazdıkça maviden kırmızıya",
             Mode::Glow => "Yazdıkça birikir, durunca söner",
             Mode::IdleActive => "Boşta nefes, uzun boşta söner",
@@ -333,6 +354,7 @@ impl Mode {
             Mode::DayTone => "Saate göre sıcak/soğuk beyaz",
             Mode::Pomodoro => "Çalışma ve mola zamanlayıcı",
             Mode::Caps => "Caps açıkken kırmızı",
+            Mode::Combine => "Arka plan + tuş + caps birlikte",
         }
     }
 
@@ -357,6 +379,7 @@ impl Mode {
             Mode::DayTone => Color32::from_rgb(255, 200, 130),
             Mode::Pomodoro => Color32::from_rgb(255, 110, 90),
             Mode::Caps => Color32::from_rgb(255, 80, 80),
+            Mode::Combine => Color32::from_rgb(160, 255, 200),
         }
     }
 
@@ -365,7 +388,6 @@ impl Mode {
             self,
             Mode::Static
                 | Mode::Breathe
-                | Mode::KeyFlash
                 | Mode::Glow
                 | Mode::IdleActive
                 | Mode::Heart
@@ -409,6 +431,18 @@ struct Settings {
     pomo_reset_nonce: u32,
     ping_host: String,
     dll_path: String,
+    // tus katmani (KeyFlash ve Combine ortak)
+    key_idle: f64,
+    key_mono: bool,
+    key_white: bool,
+    key_hue: f64,
+    key_hold: f64,
+    // combine
+    cmb_base: Mode,
+    cmb_keys: bool,
+    cmb_caps: bool,
+    caps_hue: f64,
+    caps_strength: f64,
 }
 
 fn default_dll() -> String {
@@ -445,6 +479,16 @@ impl Default for Settings {
             pomo_reset_nonce: 0,
             ping_host: "1.1.1.1".to_string(),
             dll_path: default_dll(),
+            key_idle: 10.0,
+            key_mono: false,
+            key_white: true,
+            key_hue: 0.0,
+            key_hold: 1.5,
+            cmb_base: Mode::Screen,
+            cmb_keys: true,
+            cmb_caps: true,
+            caps_hue: 0.0,
+            caps_strength: 60.0,
         }
     }
 }
@@ -495,6 +539,16 @@ impl Settings {
         t.push_str(&format!("pomo_break={}\n", self.pomo_break));
         t.push_str(&format!("ping_host={}\n", self.ping_host));
         t.push_str(&format!("dll_path={}\n", self.dll_path));
+        t.push_str(&format!("key_idle={}\n", self.key_idle));
+        t.push_str(&format!("key_mono={}\n", if self.key_mono { 1 } else { 0 }));
+        t.push_str(&format!("key_white={}\n", if self.key_white { 1 } else { 0 }));
+        t.push_str(&format!("key_hue={}\n", self.key_hue));
+        t.push_str(&format!("key_hold={}\n", self.key_hold));
+        t.push_str(&format!("cmb_base={:?}\n", self.cmb_base));
+        t.push_str(&format!("cmb_keys={}\n", if self.cmb_keys { 1 } else { 0 }));
+        t.push_str(&format!("cmb_caps={}\n", if self.cmb_caps { 1 } else { 0 }));
+        t.push_str(&format!("caps_hue={}\n", self.caps_hue));
+        t.push_str(&format!("caps_strength={}\n", self.caps_strength));
         t
     }
 
@@ -583,6 +637,40 @@ impl Settings {
                         st.ping_host = v.to_string();
                     }
                 }
+                "key_idle" => {
+                    if let Some(x) = num {
+                        st.key_idle = x.max(0.0).min(50.0);
+                    }
+                }
+                "key_mono" => st.key_mono = v == "1",
+                "key_white" => st.key_white = v == "1",
+                "key_hue" => {
+                    if let Some(x) = num {
+                        st.key_hue = x.max(0.0).min(1.0);
+                    }
+                }
+                "key_hold" => {
+                    if let Some(x) = num {
+                        st.key_hold = x.max(0.3).min(6.0);
+                    }
+                }
+                "cmb_base" => {
+                    if let Some(m) = Mode::BASES.iter().find(|m| format!("{:?}", m) == v) {
+                        st.cmb_base = *m;
+                    }
+                }
+                "cmb_keys" => st.cmb_keys = v == "1",
+                "cmb_caps" => st.cmb_caps = v == "1",
+                "caps_hue" => {
+                    if let Some(x) = num {
+                        st.caps_hue = x.max(0.0).min(1.0);
+                    }
+                }
+                "caps_strength" => {
+                    if let Some(x) = num {
+                        st.caps_strength = x.max(10.0).min(100.0);
+                    }
+                }
                 "dll_path" => {
                     if std::path::Path::new(v).exists() {
                         st.dll_path = v.to_string();
@@ -602,6 +690,8 @@ impl Settings {
 #[derive(Clone, Copy)]
 struct Inputs {
     flash: f64,
+    flash_vis: f64,
+    act: f64,
     flash_hue: f64,
     typing: f64,
     glow: f64,
@@ -650,18 +740,49 @@ fn day_tone(hour: f64) -> [f64; 3] {
     [255.0, 120.0, 30.0]
 }
 
+/// Tus katmani rengi: bosta dusuk parlaklik, tusa basinca yumusak ama patlayarak yukselir.
+fn key_color(s: &Settings, i: &Inputs) -> [f64; 3] {
+    let idle = clamp01(s.key_idle / 100.0);
+    let v = clamp01(idle + (1.0 - idle) * clamp01(i.flash_vis));
+    if s.key_mono {
+        hsv(s.key_hue, if s.key_white { 0.0 } else { 1.0 }, v)
+    } else {
+        hsv(i.flash_hue, 1.0, v)
+    }
+}
+
 /// Parlaklik haric saf renk uretimi (parlaklik motorda uygulanir). t = saniye.
 fn render(s: &Settings, i: &Inputs, t: f64) -> [f64; 3] {
+    if s.mode != Mode::Combine {
+        return render_mode(s, s.mode, i, t);
+    }
+    // Combine: arka plan + tus katmani + caps katmani ust uste
+    let base = render_mode(s, s.cmb_base, i, t);
+    let mut out = base;
+    if s.cmb_keys {
+        out = lerp3(base, key_color(s, i), clamp01(i.act));
+    }
+    if s.cmb_caps && i.caps {
+        // Parlakligi koru, sadece rengi caps rengine cevir (tus patlamasi kaybolmasin)
+        let (_, _, v) = rgb_to_hsv(out);
+        let v = v.max(0.35 * (1.0 - clamp01(i.act)));
+        let tint = hsv(s.caps_hue, 1.0, v);
+        out = lerp3(out, tint, clamp01(s.caps_strength / 100.0));
+    }
+    out
+}
+
+fn render_mode(s: &Settings, mode: Mode, i: &Inputs, t: f64) -> [f64; 3] {
     let sat = if s.white { 0.0 } else { 1.0 };
     let sp = s.speed;
-    match s.mode {
+    match mode {
         Mode::Static => hsv(s.base_hue, sat, 1.0),
         Mode::Rainbow => hsv(t * sp / 10.0, 1.0, 1.0),
         Mode::Breathe => {
             let x = (1.0 - (2.0 * PI * t * sp / 4.0).cos()) / 2.0;
             hsv(s.base_hue, sat, 0.03 + 0.97 * x.powf(1.6))
         }
-        Mode::KeyFlash => lerp3(hsv(s.base_hue, sat, 0.18), hsv(i.flash_hue, 1.0, 1.0), i.flash),
+        Mode::KeyFlash => key_color(s, i),
         Mode::TypingHeat => {
             let ty = clamp01(i.typing);
             hsv(0.62 * (1.0 - ty), 1.0, 0.30 + 0.70 * ty)
@@ -785,6 +906,7 @@ fn render(s: &Settings, i: &Inputs, t: f64) -> [f64; 3] {
                 hsv(s.base_hue, sat, 0.35)
             }
         }
+        Mode::Combine => [0.0, 0.0, 0.0],
     }
 }
 
@@ -792,6 +914,10 @@ fn render(s: &Settings, i: &Inputs, t: f64) -> [f64; 3] {
 fn demo_inputs(t: f64, s: &Settings) -> Inputs {
     let cyc = t / 1.4;
     let flash = (-(cyc.fract()) * 5.0).exp();
+    let since = cyc.fract() * 1.4;
+    let flash_vis = flash * (1.0 - (-since / 0.03).exp());
+    let c8 = t % 8.0;
+    let act = if c8 < 4.0 { clamp01(c8 / 0.2) } else { clamp01(1.0 - (c8 - 4.0) / 0.7) };
     let osc = |f: f64, ph: f64| 0.5 + 0.5 * (t * f + ph).sin();
     let c = t % 40.0;
     let (ph, fr) = if c < 20.0 {
@@ -807,6 +933,8 @@ fn demo_inputs(t: f64, s: &Settings) -> Inputs {
     let audio = ((t * 6.0).sin().abs() * (t * 1.3).sin().abs()).min(1.0);
     Inputs {
         flash,
+        flash_vis,
+        act,
         flash_hue: (cyc.floor() * 0.06).fract(),
         typing: osc(0.6, 0.0),
         glow: osc(0.4, 1.0),
@@ -1175,6 +1303,7 @@ fn poll_keys(
     flash: &mut f64,
     flash_hue: &mut f64,
     glow: &mut f64,
+    last_press: &mut f64,
     now: f64,
 ) {
     for vk in 8..255usize {
@@ -1184,6 +1313,7 @@ fn poll_keys(
         let down = unsafe { ((GetAsyncKeyState(vk as i32) as u16) & 0x8000) != 0 };
         if down && !prev[vk] {
             keys.push_back(now);
+            *last_press = now;
             *flash = 1.0;
             *flash_hue = (*flash_hue + 0.06).fract();
             *glow = (*glow + 0.07).min(1.0);
@@ -1231,6 +1361,11 @@ fn info_text(s: &Settings, i: &Inputs) -> String {
             c255(i.screen[2])
         ),
         Mode::TypingHeat => format!("Yazma hızı %{:.0}", i.typing * 100.0),
+        Mode::Combine => format!(
+            "Arka plan: {}{}",
+            s.cmb_base.name(),
+            if s.cmb_keys && i.act > 0.5 { " • yazıyor" } else { "" }
+        ),
         Mode::IdleActive => format!("Boşta {:.0} sn", i.idle_secs),
         Mode::DayTone => format!("Saat {:02}:{:02}", i.hour as i32, ((i.hour.fract()) * 60.0) as i32),
         Mode::Caps => {
@@ -1267,6 +1402,9 @@ fn engine(
     let mut flash = 0.0f64;
     let mut flash_hue = 0.0f64;
     let mut glow = 0.0f64;
+    let mut flash_vis = 0.0f64;
+    let mut act = 0.0f64;
+    let mut last_press = -1000.0f64;
     let mut typing = 0.0f64;
 
     let mut last = 0.0f64;
@@ -1307,10 +1445,12 @@ fn engine(
         }
 
         // sensor bayraklari
+        // Combine modunda sensorler arka plan katmanina gore acilir
+        let eff = if s.mode == Mode::Combine { s.cmb_base } else { s.mode };
         sens.gpu_needed
-            .store(s.mode == Mode::System && s.sys_src == SysSrc::Gpu, Ordering::Relaxed);
-        sens.ping_needed.store(s.mode == Mode::Ping, Ordering::Relaxed);
-        sens.screen_on.store(s.mode == Mode::Screen, Ordering::Relaxed);
+            .store(eff == Mode::System && s.sys_src == SysSrc::Gpu, Ordering::Relaxed);
+        sens.ping_needed.store(eff == Mode::Ping, Ordering::Relaxed);
+        sens.screen_on.store(eff == Mode::Screen, Ordering::Relaxed);
         sens.screen_strip.store(f2u(s.screen_strip), Ordering::Relaxed);
         sens.screen_vivid.store(f2u(s.screen_vivid), Ordering::Relaxed);
         if s.ping_host != last_host {
@@ -1318,7 +1458,7 @@ fn engine(
             *sens.ping_host.lock().unwrap() = last_host.clone();
             sens.ping_ms.store(-2, Ordering::Relaxed);
         }
-        if s.mode == Mode::Music && !audio_started {
+        if eff == Mode::Music && !audio_started {
             start_audio(sens.clone());
             audio_started = true;
         }
@@ -1408,6 +1548,16 @@ fn engine(
         typing += (target - typing) * (1.0 - (-dt / 0.3).exp());
         flash *= (-dt / (0.4 / s.speed.max(0.25))).exp();
         glow *= (-dt / 2.5).exp();
+        // Gorsel parlama: yumusak yukselis (~0.1 sn), sonra dogal sonum
+        if flash > flash_vis {
+            flash_vis += (flash - flash_vis) * (1.0 - (-dt / 0.03).exp());
+        } else {
+            flash_vis = flash;
+        }
+        // Yazma etkinligi: tusa basinca hizla 1, birakinca key_hold sn sonra yavasca 0
+        let act_target = if now - last_press < s.key_hold { 1.0 } else { 0.0 };
+        let act_tau = if act_target > act { 0.05 } else { 0.7 };
+        act += (act_target - act) * (1.0 - (-dt / act_tau).exp());
 
         // Ses
         let age_ms = (sens.epoch.elapsed().as_millis() as u64)
@@ -1494,6 +1644,8 @@ fn engine(
 
         let inp = Inputs {
             flash,
+            flash_vis,
+            act,
             flash_hue,
             typing,
             glow,
@@ -1542,7 +1694,15 @@ fn engine(
             if tn >= next_frame {
                 break;
             }
-            poll_keys(&mut prev_down, &mut keys, &mut flash, &mut flash_hue, &mut glow, tn);
+            poll_keys(
+                &mut prev_down,
+                &mut keys,
+                &mut flash,
+                &mut flash_hue,
+                &mut glow,
+                &mut last_press,
+                tn,
+            );
             std::thread::sleep(Duration::from_millis(3));
         }
     }
@@ -1678,6 +1838,36 @@ fn hue_slider(ui: &mut egui::Ui, hue: &mut f64) {
     p.rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(90)));
 }
 
+/// Tus katmani ayarlari (Tus dalgasi modu ve Combine ortak kullanir).
+fn key_panel(ui: &mut egui::Ui, s: &mut Settings, show_hold: bool) {
+    ui.checkbox(&mut s.key_mono, "Tek renk (renk değişmesin)");
+    if s.key_mono {
+        ui.checkbox(&mut s.key_white, "Beyaz");
+        if !s.key_white {
+            ui.label("Tuş rengi");
+            hue_slider(ui, &mut s.key_hue);
+        }
+    } else {
+        ui.label(
+            egui::RichText::new("Her tuşta renk kayar (çok renkli)")
+                .small()
+                .color(Color32::from_gray(130)),
+        );
+    }
+    ui.add(
+        egui::Slider::new(&mut s.key_idle, 0.0..=50.0)
+            .text("Boşta parlaklık %")
+            .fixed_decimals(0),
+    );
+    if show_hold {
+        ui.add(
+            egui::Slider::new(&mut s.key_hold, 0.3..=6.0)
+                .text("Yazma bitince arka plana dön (sn)")
+                .fixed_decimals(1),
+        );
+    }
+}
+
 struct App {
     settings: Settings,
     shared: Arc<Mutex<Settings>>,
@@ -1743,22 +1933,58 @@ impl eframe::App for App {
         egui::SidePanel::right("opts").min_width(300.0).show(ctx, |ui| {
             ui.add_space(8.0);
             let m = self.settings.mode;
+            let eff = if m == Mode::Combine { self.settings.cmb_base } else { m };
             ui.heading(egui::RichText::new(m.name()).color(m.accent()));
             ui.label(egui::RichText::new(m.desc()).color(Color32::from_gray(150)));
             ui.separator();
 
-            if m.uses_hue() {
+            if m == Mode::Combine {
+                egui::ComboBox::from_label("Arka plan (tuşa basılmazken)")
+                    .selected_text(self.settings.cmb_base.name())
+                    .show_ui(ui, |ui| {
+                        for b in Mode::BASES.iter() {
+                            ui.selectable_value(&mut self.settings.cmb_base, *b, b.name());
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.settings.cmb_keys, "Tuş katmanı (yazarken devreye girer)");
+                if self.settings.cmb_keys {
+                    key_panel(ui, &mut self.settings, true);
+                }
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.settings.cmb_caps, "Caps Lock katmanı");
+                if self.settings.cmb_caps {
+                    ui.label("Caps rengi");
+                    hue_slider(ui, &mut self.settings.caps_hue);
+                    ui.add(
+                        egui::Slider::new(&mut self.settings.caps_strength, 10.0..=100.0)
+                            .text("Renk gücü %")
+                            .fixed_decimals(0),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("Arka plan ayarları: {}", eff.name())).strong(),
+                );
+                ui.add_space(4.0);
+            } else if m == Mode::KeyFlash {
+                key_panel(ui, &mut self.settings, false);
+                ui.add_space(6.0);
+            }
+
+            if eff.uses_hue() {
                 ui.label("Renk tonu");
                 hue_slider(ui, &mut self.settings.base_hue);
                 ui.checkbox(&mut self.settings.white, "Beyaz (renksiz)");
                 ui.add_space(6.0);
             }
-            if m.uses_speed() {
+            if eff.uses_speed() || (m == Mode::Combine && self.settings.cmb_keys) {
                 ui.add(egui::Slider::new(&mut self.settings.speed, 0.25..=4.0).text("Hız"));
                 ui.add_space(6.0);
             }
 
-            match m {
+            match eff {
                 Mode::System => {
                     let label = match self.settings.sys_src {
                         SysSrc::Cpu => "CPU yükü",
