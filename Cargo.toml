@@ -1,0 +1,11 @@
+[package]
+name = "tulpar_led_studio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+cpal = "0.15"
+
+[profile.release]
+opt-level = 3
